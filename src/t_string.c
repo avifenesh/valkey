@@ -757,7 +757,16 @@ void lcsCommand(client *c) {
 #define LCS(A, B) lcs[(B) + ((A) * (blen + 1))]
 
     /* Try to allocate the LCS table, and abort on overflow or insufficient memory. */
-    unsigned long long lcssize = (unsigned long long)(alen + 1) * (blen + 1); /* Can't overflow due to the size limits above. */
+    unsigned long long lcssize;
+    
+    /* If we only need the length, we can optimize memory usage by using only
+     * two rows of the LCS table (O(min(N,M))). */
+    int computelcs = getidx || !getlen;
+    if (computelcs) {
+        lcssize = (unsigned long long)(alen + 1) * (blen + 1); /* Can't overflow due to the size limits above. */
+    } else {
+        lcssize = (unsigned long long)(blen + 1) * 2;
+    }
     unsigned long long lcsalloc = lcssize * sizeof(uint32_t);
     uint32_t *lcs = NULL;
     if (lcsalloc < SIZE_MAX && lcsalloc / lcssize == sizeof(uint32_t)) {
@@ -773,32 +782,51 @@ void lcsCommand(client *c) {
     }
 
     /* Start building the LCS table. */
-    for (uint32_t i = 0; i <= alen; i++) {
-        for (uint32_t j = 0; j <= blen; j++) {
-            if (i == 0 || j == 0) {
-                /* If one substring has length of zero, the
-                 * LCS length is zero. */
-                LCS(i, j) = 0;
-            } else if (a[i - 1] == b[j - 1]) {
-                /* The len LCS (and the LCS itself) of two
-                 * sequences with the same final character, is the
-                 * LCS of the two sequences without the last char
-                 * plus that last char. */
-                LCS(i, j) = LCS(i - 1, j - 1) + 1;
-            } else {
-                /* If the last character is different, take the longest
-                 * between the LCS of the first string and the second
-                 * minus the last char, and the reverse. */
-                uint32_t lcs1 = LCS(i - 1, j);
-                uint32_t lcs2 = LCS(i, j - 1);
-                LCS(i, j) = lcs1 > lcs2 ? lcs1 : lcs2;
+    if (computelcs) {
+        for (uint32_t i = 0; i <= alen; i++) {
+            for (uint32_t j = 0; j <= blen; j++) {
+                if (i == 0 || j == 0) {
+                    /* If one substring has length of zero, the
+                     * LCS length is zero. */
+                    LCS(i, j) = 0;
+                } else if (a[i - 1] == b[j - 1]) {
+                    /* The len LCS (and the LCS itself) of two
+                     * sequences with the same final character, is the
+                     * LCS of the two sequences without the last char
+                     * plus that last char. */
+                    LCS(i, j) = LCS(i - 1, j - 1) + 1;
+                } else {
+                    /* If the last character is different, take the longest
+                     * between the LCS of the first string and the second
+                     * minus the last char, and the reverse. */
+                    uint32_t lcs1 = LCS(i - 1, j);
+                    uint32_t lcs2 = LCS(i, j - 1);
+                    LCS(i, j) = lcs1 > lcs2 ? lcs1 : lcs2;
+                }
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i <= alen; i++) {
+            uint32_t *v0 = lcs + ((i & 1) * (blen + 1));
+            uint32_t *v1 = lcs + (((i - 1) & 1) * (blen + 1));
+            for (uint32_t j = 0; j <= blen; j++) {
+                if (i == 0 || j == 0) {
+                    v0[j] = 0;
+                } else if (a[i - 1] == b[j - 1]) {
+                    v0[j] = v1[j - 1] + 1;
+                } else {
+                    uint32_t lcs1 = v1[j];
+                    uint32_t lcs2 = v0[j - 1];
+                    v0[j] = lcs1 > lcs2 ? lcs1 : lcs2;
+                }
             }
         }
     }
 
     /* Store the actual LCS string in "result" if needed. We create
      * it backward, but the length is already known, we store it into idx. */
-    uint32_t idx = LCS(alen, blen);
+    uint32_t idx = 0;
+    if (computelcs) idx = LCS(alen, blen);
     sds result = NULL;            /* Resulting LCS string. */
     void *arraylenptr = NULL;     /* Deferred length of the array for IDX. */
     uint32_t arange_start = alen, /* alen signals that values are not set. */
@@ -807,7 +835,6 @@ void lcsCommand(client *c) {
              brange_end = 0;
 
     /* Do we need to compute the actual LCS string? Allocate it in that case. */
-    int computelcs = getidx || !getlen;
     if (computelcs) result = sdsnewlen(SDS_NOINIT, idx);
 
     /* Start with a deferred array if we have to emit the ranges. */
@@ -888,7 +915,10 @@ void lcsCommand(client *c) {
         addReplyLongLong(c, LCS(alen, blen));
         setDeferredArrayLen(c, arraylenptr, arraylen);
     } else if (getlen) {
-        addReplyLongLong(c, LCS(alen, blen));
+        if (computelcs)
+            addReplyLongLong(c, LCS(alen, blen));
+        else
+            addReplyLongLong(c, lcs[(alen & 1) * (blen + 1) + blen]);
     } else {
         addReplyBulkSds(c, result);
         result = NULL;
