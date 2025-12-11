@@ -1965,3 +1965,11 @@ test {CONFIG hash-seed is immutable and settable at startup} {
         }
     }
 } {} {external:skip}
+
+test {CONFIG SET rejects duplicate parameters in a single call} {
+    start_server {tags {"introspection"}} {
+        assert_error "ERR CONFIG SET failed (possibly related to argument 'timeout') - duplicate parameter" {
+            r config set timeout 1 timeout 2
+        }
+    }
+} {} {external:skip}

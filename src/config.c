@@ -782,6 +782,44 @@ static void restoreBackupConfig(standardConfig **set_configs,
     }
 }
 
+static inline size_t nextPow2Size(size_t n) {
+    size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+static inline uint64_t hashStandardConfigPtr(standardConfig *config) {
+    return dictGenHashFunction(&config, sizeof(config));
+}
+
+static inline int standardConfigPtrSetAdd(standardConfig **table, size_t table_size, standardConfig *config) {
+    serverAssert((table_size & (table_size - 1)) == 0); /* power of two */
+    size_t mask = table_size - 1;
+    size_t idx = hashStandardConfigPtr(config) & mask;
+    while (table[idx] != NULL) {
+        if (table[idx] == config) return 0; /* already exists */
+        idx = (idx + 1) & mask;
+    }
+    table[idx] = config;
+    return 1;
+}
+
+static inline uint64_t hashApplyFn(apply_fn fn) {
+    return dictGenHashFunction(&fn, sizeof(fn));
+}
+
+static inline int applyFnSetAdd(apply_fn *table, size_t table_size, apply_fn fn) {
+    serverAssert((table_size & (table_size - 1)) == 0); /* power of two */
+    size_t mask = table_size - 1;
+    size_t idx = hashApplyFn(fn) & mask;
+    while (table[idx] != NULL) {
+        if (table[idx] == fn) return 0; /* already exists */
+        idx = (idx + 1) & mask;
+    }
+    table[idx] = fn;
+    return 1;
+}
+
 /*-----------------------------------------------------------------------------
  * CONFIG SET implementation
  *----------------------------------------------------------------------------*/
@@ -796,9 +834,13 @@ void configSetCommand(client *c) {
     sds *new_values;
     sds *old_values = NULL;
     apply_fn *apply_fns; /* TODO: make this a set for better performance */
-    int config_count, i, j;
+    int config_count, i;
     int invalid_args = 0, deny_loading_error = 0;
     int *config_map_fns;
+    int apply_fn_count = 0;
+    standardConfig **seen_configs_set = NULL;
+    apply_fn *seen_apply_fns_set = NULL;
+    size_t set_table_size = 0;
 
     /* Make sure we have an even number of arguments: conf-val pairs */
     if (c->argc & 1) {
@@ -814,6 +856,15 @@ void configSetCommand(client *c) {
     old_values = zcalloc(sizeof(sds *) * config_count);
     apply_fns = zcalloc(sizeof(apply_fn) * config_count);
     config_map_fns = zmalloc(sizeof(int) * config_count);
+
+    if (config_count) {
+        /* Keep load factor <= 0.5 to avoid long probe sequences. */
+        size_t target = (size_t)config_count * 2;
+        if (target < 4) target = 4;
+        set_table_size = nextPow2Size(target);
+        seen_configs_set = zcalloc(sizeof(*seen_configs_set) * set_table_size);
+        seen_apply_fns_set = zcalloc(sizeof(*seen_apply_fns_set) * set_table_size);
+    }
 
     /* Find all relevant configs */
     for (i = 0; i < config_count; i++) {
@@ -855,15 +906,14 @@ void configSetCommand(client *c) {
         }
 
         /* If this config appears twice then fail */
-        for (j = 0; j < i; j++) {
-            if (set_configs[j] == config) {
-                /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
-                errstr = "duplicate parameter";
-                err_arg_name = c->argv[2 + i * 2]->ptr;
-                invalid_args = 1;
-                break;
-            }
+        if (seen_configs_set && !standardConfigPtrSetAdd(seen_configs_set, set_table_size, config)) {
+            /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
+            errstr = "duplicate parameter";
+            err_arg_name = c->argv[2 + i * 2]->ptr;
+            invalid_args = 1;
+            continue;
         }
+
         set_configs[i] = config;
         config_names[i] = config->name;
         new_values[i] = c->argv[2 + i * 2 + 1]->ptr;
@@ -886,18 +936,12 @@ void configSetCommand(client *c) {
             if (set_configs[i]->flags & MODULE_CONFIG) {
                 addModuleConfigApply(module_configs_apply, set_configs[i]->privdata);
             } else if (set_configs[i]->interface.apply) {
-                /* Check if this apply function is already stored */
-                int exists = 0;
-                for (j = 0; apply_fns[j] != NULL && j <= i; j++) {
-                    if (apply_fns[j] == set_configs[i]->interface.apply) {
-                        exists = 1;
-                        break;
-                    }
-                }
-                /* Apply function not stored, store it */
-                if (!exists) {
-                    apply_fns[j] = set_configs[i]->interface.apply;
-                    config_map_fns[j] = i;
+                apply_fn fn = set_configs[i]->interface.apply;
+                /* Store each apply function once, preserving first-seen order. */
+                if (seen_apply_fns_set && applyFnSetAdd(seen_apply_fns_set, set_table_size, fn)) {
+                    apply_fns[apply_fn_count] = fn;
+                    config_map_fns[apply_fn_count] = i;
+                    apply_fn_count++;
                 }
             }
         }
@@ -939,6 +983,8 @@ err:
         addReplyErrorFormat(c, "CONFIG SET failed (possibly related to argument '%s')", err_arg_name);
     }
 end:
+    zfree(seen_configs_set);
+    zfree(seen_apply_fns_set);
     zfree(set_configs);
     zfree(config_names);
     zfree(new_values);
