@@ -6777,6 +6777,16 @@ static void clusterSetPrimary(clusterNode *n, int closeSlots, int full_sync_requ
     serverAssert(n != myself);
     serverAssert(myself->numslots == 0);
 
+    /* If we are in the middle of a sync-from-replica operation (Phase 1),
+     * any cluster topology change must abort the sibling sync first.
+     * We clear the guard flag, free the sibling address, and let the normal
+     * clusterSetPrimary flow proceed — which will call replicationSetPrimary
+     * with the new target, canceling the old connection to the sibling. */
+    if (server.cluster_syncing_from_sibling) {
+        serverLog(LL_NOTICE, "Sync-from-replica: aborting sibling sync due to cluster reconfiguration");
+        replicationAbortSiblingSync();
+    }
+
     if (clusterNodeIsPrimary(myself)) {
         myself->flags &= ~(CLUSTER_NODE_PRIMARY | CLUSTER_NODE_MIGRATE_TO);
         myself->flags |= CLUSTER_NODE_REPLICA;
@@ -8095,6 +8105,72 @@ int clusterCommandSpecial(client *c) {
          * In these both cases, myself as a replica has to do a full sync. */
         clusterSetPrimary(n, 1, 1);
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE | CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
+
+        /* Sync-from-replica optimization: instead of syncing the RDB from
+         * the primary, find the best sibling replica and redirect the
+         * replication connection there.  Cluster topology still says N→P
+         * (set by clusterSetPrimary above), but the TCP connection goes to S.
+         *
+         * Selection criteria:
+         *   1) Not in FAIL or PFAIL state
+         *   2) Has a non-zero replication offset (not freshly added)
+         *   3) Highest repl_offset wins (closest to primary, lowest lag)
+         *
+         * If no eligible sibling is found, we keep the normal connection
+         * to the primary (already established by clusterSetPrimary). */
+        if (server.repl_prefer_sync_from_replica && n->num_replicas > 0 && n->replicas) {
+            clusterNode *best_sibling = NULL;
+            long long best_offset = -1;
+
+            for (int j = 0; j < n->num_replicas; j++) {
+                clusterNode *s = n->replicas[j];
+                /* Skip ourselves, failed, or suspected-failed nodes. */
+                if (s == myself) continue;
+                if (nodeFailed(s) || nodeTimedOut(s)) continue;
+                /* Skip replicas with zero offset (freshly added, no data). */
+                if (s->repl_offset == 0) continue;
+
+                if (s->repl_offset > best_offset) {
+                    best_offset = s->repl_offset;
+                    best_sibling = s;
+                }
+            }
+
+            if (best_sibling) {
+                serverLog(LL_NOTICE,
+                          "Sync-from-replica: selected sibling %.40s (%s) at offset %lld "
+                          "(primary %.40s at offset %lld, gap %lld)",
+                          best_sibling->name, humanNodename(best_sibling), best_offset,
+                          n->name, (long long)n->repl_offset,
+                          (long long)(n->repl_offset - best_offset));
+
+                /* Set the guard flag and save sibling address. */
+                server.cluster_syncing_from_sibling = 1;
+                if (server.sync_sibling_host) sdsfree(server.sync_sibling_host);
+                server.sync_sibling_host = sdsnew(best_sibling->ip);
+                server.sync_sibling_port = getNodeDefaultReplicationPort(best_sibling);
+
+                /* Open a SEPARATE rdb-only connection to the sibling.
+                 * The main replication channel stays connected to P
+                 * (set up by clusterSetPrimary -> replicationSetPrimary above).
+                 * The sibling channel gets the RDB, while P's channel will
+                 * later PSYNC at the offset from S's +FULLRESYNC. */
+                if (replicationOpenSiblingRdbChannel(
+                        best_sibling->ip,
+                        server.sync_sibling_port) == C_ERR) {
+                    serverLog(LL_WARNING,
+                              "Sync-from-replica: failed to open sibling channel, "
+                              "falling back to normal sync from primary");
+                    clearSiblingSyncState();
+                }
+            } else {
+                serverLog(LL_NOTICE,
+                          "Sync-from-replica: no eligible sibling found for primary %.40s (%s), "
+                          "using normal full sync from primary",
+                          n->name, humanNodename(n));
+            }
+        }
+
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "count-failure-reports") && c->argc == 3) {
         /* CLUSTER COUNT-FAILURE-REPORTS <NODE ID> */
@@ -8134,6 +8210,15 @@ int clusterCommandSpecial(client *c) {
         if (replicaid != NULL && memcmp(objectGetVal(replicaid), myself->name, CLUSTER_NAMELEN) != 0) {
             /* Ignore this command, including the sanity check and the process. */
             addReply(c, shared.ok);
+            return 1;
+        }
+
+        /* Block failover if we are syncing from a sibling replica.
+         * During Phase 1, this node has an incomplete dataset — promotion
+         * would cause data loss. This blocks FORCE and TAKEOVER too, which
+         * bypass cluster-replica-no-failover. */
+        if (server.cluster_syncing_from_sibling) {
+            addReplyError(c, "Node is syncing from sibling, cannot failover");
             return 1;
         }
 

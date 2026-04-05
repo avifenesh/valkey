@@ -456,6 +456,17 @@ typedef enum {
     REPL_DUAL_CHANNEL_RDB_LOADED,
 } repl_rdb_channel_state;
 
+/* Sibling RDB channel states for sync-from-replica. */
+typedef enum {
+    REPL_SIBLING_NONE = 0,
+    REPL_SIBLING_SEND_HANDSHAKE, /* Send AUTH + REPLCONF + PSYNC pipeline */
+    REPL_SIBLING_RECV_AUTH,      /* Wait for AUTH reply */
+    REPL_SIBLING_RECV_REPLCONF,  /* Wait for REPLCONF reply */
+    REPL_SIBLING_SEND_PSYNC,     /* Send PSYNC ? -1 */
+    REPL_SIBLING_RECV_PSYNC,     /* Wait for +FULLRESYNC reply */
+    REPL_SIBLING_RDB_TRANSFER,   /* BIO downloading RDB */
+} repl_sibling_state;
+
 typedef enum {
     REPL_BIO_DISK_SAVE_STATE_NONE = 0,    /* No active disk-saving Bio thread */
     REPL_BIO_DISK_SAVE_STATE_IN_PROGRESS, /* The disk-saving Bio job has been created */
@@ -1110,10 +1121,16 @@ typedef struct replBacklog {
 } replBacklog;
 
 typedef struct replDataBuf {
-    list *blocks; /* List of replDataBufBlock */
-    size_t mem;   /* Total allocated memory including buffer metadata and list nodes */
-    size_t len;   /* Total replication data bytes pending processing */
-    size_t peak;  /* Peak value of len during buffer lifetime */
+    list *blocks;          /* List of replDataBufBlock */
+    size_t mem;            /* Total allocated memory including buffer metadata and list nodes */
+    size_t len;            /* Total replication data bytes pending processing */
+    size_t peak;           /* Peak value of len during buffer lifetime */
+    int spill_fd;          /* Temp file fd for disk spill, -1 if not spilling */
+    char *spill_tmpfile;   /* Temp file path for disk spill */
+    off_t spill_written;   /* Bytes written to spill file */
+    off_t spill_read;      /* Bytes read back from spill file during drain */
+    off_t spill_fsync_off; /* Last fsync offset in spill file */
+    size_t mem_limit;      /* Memory threshold before spilling to disk */
 } replDataBuf;
 
 typedef struct {
@@ -2157,6 +2174,12 @@ struct valkeyServer {
                                                  * delay (start sooner if they all connect). */
     int dual_channel_replication;               /* Config used to determine if the replica should
                                                  * use dual channel replication for full syncs. */
+    int repl_prefer_sync_from_replica;          /* Enable sync-from-replica optimization. */
+    long long repl_sync_buffer_mem_limit;       /* Memory limit before disk spill for repl buffer. */
+    int cluster_syncing_from_sibling;           /* Guard flag: syncing from sibling replica in progress. */
+    char *sync_sibling_host;                    /* Sibling replica host for sync-from-replica. */
+    int sync_sibling_port;                      /* Sibling replica port for sync-from-replica. */
+    int repl_sibling_channel_state;             /* Sibling RDB channel state (repl_sibling_state enum). */
     _Atomic(int) replica_bio_disk_save_state;   /* Flag set by the bio thread to indicate that the
                                                  * RDB save to disk has completed, or failed */
     _Atomic(bool) replica_bio_abort_save;       /* Flag set by main thread, used to signal to replica's
@@ -3207,6 +3230,11 @@ void freeReplicaReferencedReplBuffer(client *replica);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
 void updateReplicasWaitingBgsave(int bgsaveerr, int type);
 void replicationCron(void);
+void removeStaleReplSpillFiles(void);
+int replicationOpenSiblingRdbChannel(char *host, int port);
+void replicationAbortSiblingSync(void);
+void clearSiblingSyncState(void);
+void siblingFallbackToPrimary(void);
 void replicationStartPendingFork(void);
 void replicationHandlePrimaryDisconnection(void);
 void replicationCachePrimary(client *c);

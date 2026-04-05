@@ -50,6 +50,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include <glob.h>
 
 void cleanupTransferResources(void);
 void replicationAbortSyncTransfer(void);
@@ -61,10 +62,13 @@ int replicaPutOnline(client *replica);
 void replicaStartCommandStream(client *replica);
 int cancelReplicationHandshake(int reconnect);
 void replicationSteadyStateInit(void);
+void resetBioRDBSaveState(void);
 void dualChannelSetupMainConnForPsync(connection *conn);
 void dualChannelSyncHandleRdbLoadCompletion(void);
 static void dualChannelFullSyncWithPrimary(connection *conn);
+static void siblingRdbChannelHandler(connection *conn);
 void syncWithPrimary(connection *conn);
+int connectWithPrimary(void);
 
 /* We take a global flag to remember if this instance generated an RDB
  * because of replication, so that we can remove the RDB file in case
@@ -1233,12 +1237,25 @@ void syncCommand(client *c) {
          * and its exact requirements. */
         if (ln && ((c->repl_data->replica_capa & replica->repl_data->replica_capa) == replica->repl_data->replica_capa) &&
             c->repl_data->replica_req == replica->repl_data->replica_req) {
-            /* Perfect, the server is already registering differences for
-             * another replica. Set the right state, and copy the buffer.
-             * We don't copy buffer if clients don't want. */
-            if (!c->flag.repl_rdbonly) copyReplicaOutputBuffer(c, replica);
-            replicationSetupReplicaForFullResync(c, replica->repl_data->psync_initial_offset);
-            serverLog(LL_NOTICE, "Waiting for end of BGSAVE for SYNC");
+            /* An rdb-only client must NOT piggyback on an existing BGSAVE that
+             * was triggered by a non-rdb-only replica.  rdb-only clients skip
+             * the output buffer copy (below), so the offset from +FULLRESYNC
+             * would be stale — the RDB content reflects commands buffered after
+             * the fork, but those commands won't be streamed to the rdb-only
+             * client.  This causes duplicate application of non-idempotent
+             * commands (INCR, LPUSH, etc.).  Force a fresh BGSAVE instead. */
+            if (c->flag.repl_rdbonly && !(replica->flag.repl_rdbonly)) {
+                serverLog(LL_NOTICE,
+                          "rdb-only sync cannot attach to existing BGSAVE started by a "
+                          "non-rdb-only replica. Waiting for fresh BGSAVE for SYNC");
+            } else {
+                /* Perfect, the server is already registering differences for
+                 * another replica. Set the right state, and copy the buffer.
+                 * We don't copy buffer if clients don't want. */
+                if (!c->flag.repl_rdbonly) copyReplicaOutputBuffer(c, replica);
+                replicationSetupReplicaForFullResync(c, replica->repl_data->psync_initial_offset);
+                serverLog(LL_NOTICE, "Waiting for end of BGSAVE for SYNC");
+            }
         } else {
             /* No way, we need to wait for the next BGSAVE in order to
              * register differences. */
@@ -2397,6 +2414,19 @@ void replicaAfterLoadPrimaryRDB(connection *conn, rdbSaveInfo *rsi, int disk_bas
         connClose(conn);
         server.repl_rdb_transfer_s = NULL;
     }
+
+    /* Sync-from-replica: close the sibling RDB channel (BIO finished, RDB
+     * consumed).  Keep cluster_syncing_from_sibling SET — it's needed by
+     * the +CONTINUE handler to install bufferReplData if PSYNC hasn't
+     * completed yet.  clearSiblingSyncState runs later in
+     * dualChannelSyncSuccess after the buffer is drained. */
+    if (server.cluster_syncing_from_sibling && server.cluster_enabled) {
+        serverLog(LL_NOTICE, "Sync-from-replica: RDB loaded from sibling, entering buffer drain");
+        if (server.repl_rdb_transfer_s) {
+            connClose(server.repl_rdb_transfer_s);
+            server.repl_rdb_transfer_s = NULL;
+        }
+    }
 }
 
 int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, int *usemark, rdbSaveInfo *rsi) {
@@ -2933,6 +2963,18 @@ void freePendingReplDataBuf(void) {
     server.pending_repl_data.blocks = NULL;
     server.pending_repl_data.mem = 0;
     server.pending_repl_data.len = 0;
+    if (server.pending_repl_data.spill_fd != -1) {
+        close(server.pending_repl_data.spill_fd);
+        server.pending_repl_data.spill_fd = -1;
+    }
+    if (server.pending_repl_data.spill_tmpfile) {
+        bg_unlink(server.pending_repl_data.spill_tmpfile);
+        zfree(server.pending_repl_data.spill_tmpfile);
+        server.pending_repl_data.spill_tmpfile = NULL;
+    }
+    server.pending_repl_data.spill_written = 0;
+    server.pending_repl_data.spill_read = 0;
+    server.pending_repl_data.spill_fsync_off = 0;
 }
 
 void receiveRDBinBioThread(bool is_dual_channel) {
@@ -2980,6 +3022,325 @@ void replicationAbortDualChannelSyncTransfer(void) {
     server.rdb_client_id = -1;
     freePendingReplDataBuf();
     return;
+}
+
+/* ---------------------------------------------------------------------------
+ * Sync-from-replica: sibling RDB side-channel
+ *
+ * Opens an independent connection to a sibling replica S, sends
+ *   REPLCONF rdb-only 1 + PSYNC ? -1
+ * to fetch just the RDB snapshot.  The connection is stored in
+ * server.repl_rdb_transfer_s and the RDB is saved to a temp file
+ * via a BIO thread, exactly like the normal disk-based full sync path.
+ *
+ * This runs IN PARALLEL with the main channel, which PSYNCs to the real
+ * primary P.  After the sibling RDB is loaded, the main channel continues
+ * as normal — no "switch to primary" step is needed because we are ALREADY
+ * connected to P.
+ * --------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * Sibling RDB channel — async state machine (TLS-compatible).
+ *
+ * Each state sends or receives one protocol message, then returns to the
+ * event loop.  The connection read handler fires siblingRdbChannelHandler
+ * again when the next reply is available.
+ *
+ * States: SEND_HANDSHAKE → RECV_AUTH → RECV_REPLCONF → SEND_PSYNC →
+ *         RECV_PSYNC → (open temp file, start BIO, resume main channel)
+ * --------------------------------------------------------------------------- */
+
+/* Send the handshake pipeline: AUTH (if needed) + REPLCONF capa eof rdb-only 1. */
+static int siblingHandleSendHandshake(connection *conn, sds *err) {
+    if (server.primary_auth) {
+        *err = replicationSendAuth(conn);
+        if (*err) return C_ERR;
+    }
+    *err = sendCommand(conn, "REPLCONF", "capa", "eof", "rdb-only", "1", NULL);
+    if (*err) return C_ERR;
+
+    /* Install the read handler so the event loop calls us back. */
+    if (connSetReadHandler(conn, siblingRdbChannelHandler) == C_ERR) {
+        *err = sdsnew("Can't install read handler on sibling connection");
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Receive AUTH reply (only called when primary_auth is set). */
+static int siblingHandleRecvAuth(connection *conn, sds *err) {
+    *err = receiveSynchronousResponse(conn);
+    if (*err == NULL) {
+        *err = sdsnew("No AUTH response from sibling");
+        return C_ERR;
+    }
+    if ((*err)[0] == '-') return C_ERR;
+    sdsfree(*err);
+    *err = NULL;
+    return C_OK;
+}
+
+/* Receive REPLCONF reply. */
+static int siblingHandleRecvReplconf(connection *conn, sds *err) {
+    *err = receiveSynchronousResponse(conn);
+    if (*err == NULL) {
+        *err = sdsnew("No REPLCONF response from sibling");
+        return C_ERR;
+    }
+    if ((*err)[0] == '-') return C_ERR;
+    sdsfree(*err);
+    *err = NULL;
+    return C_OK;
+}
+
+/* Send PSYNC ? -1. */
+static int siblingHandleSendPsync(connection *conn, sds *err) {
+    *err = sendCommand(conn, "PSYNC", "?", "-1", NULL);
+    if (*err) return C_ERR;
+    return C_OK;
+}
+
+/* Receive and parse +FULLRESYNC, store offset, open temp file, start BIO. */
+static int siblingHandleRecvPsync(connection *conn, sds *err) {
+    *err = receiveSynchronousResponse(conn);
+    if (*err == NULL) {
+        *err = sdsnew("No PSYNC response from sibling");
+        return C_ERR;
+    }
+
+    if (sdslen(*err) == 0) {
+        /* Empty line = keepalive ping, retry on next event. */
+        sdsfree(*err);
+        *err = NULL;
+        return C_RETRY;
+    }
+
+    if (strncmp(*err, "+FULLRESYNC", 11) != 0) return C_ERR;
+
+    /* Parse replid and offset. */
+    char *p = *err + 12;
+    if (strlen(p) < CONFIG_RUN_ID_SIZE + 2) return C_ERR;
+
+    char replid[CONFIG_RUN_ID_SIZE + 1];
+    memcpy(replid, p, CONFIG_RUN_ID_SIZE);
+    replid[CONFIG_RUN_ID_SIZE] = '\0';
+    long long offset = strtoll(p + CONFIG_RUN_ID_SIZE + 1, NULL, 10);
+
+    serverLog(LL_NOTICE, "Sync-from-replica: sibling FULLRESYNC replid=%s offset=%lld",
+              replid, offset);
+
+    /* Store in repl_provisional_primary for the main channel PSYNC. */
+    memcpy(server.repl_provisional_primary.replid, replid, CONFIG_RUN_ID_SIZE + 1);
+    server.repl_provisional_primary.reploff = offset;
+    server.repl_provisional_primary.read_reploff = offset;
+    server.repl_provisional_primary.conn = server.repl_transfer_s;
+    server.repl_provisional_primary.dbid = 0; /* Default DB; RDB aux may override */
+    server.primary_initial_offset = offset;
+    server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_RDB_LOAD;
+
+    sdsfree(*err);
+    *err = NULL;
+
+    /* Open temp file using the STANDARD repl_transfer_fd/tmpfile fields. */
+    char tmpfile[256];
+    snprintf(tmpfile, sizeof(tmpfile), "temp-%d-sibling-rdb.rdb", (int)getpid());
+    int dfd = open(tmpfile, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (dfd == -1) {
+        *err = sdscatprintf(sdsempty(), "Can't open temp file %s: %s", tmpfile, strerror(errno));
+        return C_ERR;
+    }
+    if (server.repl_transfer_fd != -1) close(server.repl_transfer_fd);
+    if (server.repl_transfer_tmpfile) {
+        bg_unlink(server.repl_transfer_tmpfile);
+        zfree(server.repl_transfer_tmpfile);
+    }
+    server.repl_transfer_fd = dfd;
+    server.repl_transfer_tmpfile = zstrdup(tmpfile);
+
+    serverLog(LL_NOTICE, "Sync-from-replica: receiving RDB from sibling to %s", tmpfile);
+
+    /* Hand off to BIO for the RDB download. */
+    connSetReadHandler(conn, NULL);
+    server.repl_rdb_transfer_s = conn;
+    server.repl_transfer_lastio = server.unixtime;
+    server.repl_sibling_channel_state = REPL_SIBLING_RDB_TRANSFER;
+    bioCreateSaveRDBToDiskJob(conn, 1);
+
+    /* Resume the main channel to P — only if it has reached SEND_PSYNC
+     * (paused by the sibling guard).  If the main channel is still in an
+     * earlier handshake state, the event loop will naturally advance it
+     * and the guard will let PSYNC through now that rdb_channel_state != NONE. */
+    if (server.repl_transfer_s && server.repl_state == REPL_STATE_SEND_PSYNC) {
+        serverLog(LL_NOTICE, "Sync-from-replica: resuming main channel PSYNC to primary");
+        syncWithPrimary(server.repl_transfer_s);
+    }
+    return C_OK;
+}
+
+/* Main event-driven handler for the sibling RDB channel. Called on connect
+ * (after TLS handshake) and on each readable event during the handshake. */
+static void siblingRdbChannelHandler(connection *conn) {
+    sds err = NULL;
+    int ret = C_OK;
+
+    /* If the connection isn't ready yet (TLS handshake in progress),
+     * just return — the event loop will call us again when it completes. */
+    if (connGetState(conn) != CONN_STATE_CONNECTED) {
+        if (connGetState(conn) == CONN_STATE_CONNECTING || connGetState(conn) == CONN_STATE_ACCEPTING) {
+            return; /* TLS not done yet. */
+        }
+        serverLog(LL_WARNING, "Sync-from-replica: sibling connection error: %s",
+                  connGetLastError(conn));
+        goto error;
+    }
+
+    switch (server.repl_sibling_channel_state) {
+    case REPL_SIBLING_SEND_HANDSHAKE:
+        serverLog(LL_NOTICE, "Sync-from-replica: sibling RDB channel connected to %s:%d",
+                  server.sync_sibling_host, server.sync_sibling_port);
+        ret = siblingHandleSendHandshake(conn, &err);
+        if (ret == C_OK) {
+            server.repl_sibling_channel_state = server.primary_auth
+                                                    ? REPL_SIBLING_RECV_AUTH
+                                                    : REPL_SIBLING_RECV_REPLCONF;
+        }
+        break;
+
+    case REPL_SIBLING_RECV_AUTH:
+        ret = siblingHandleRecvAuth(conn, &err);
+        if (ret != C_OK) break;
+        server.repl_sibling_channel_state = REPL_SIBLING_RECV_REPLCONF;
+        /* Pipelined responses: REPLCONF reply likely already buffered. */
+        /* fall through */
+
+    case REPL_SIBLING_RECV_REPLCONF:
+        ret = siblingHandleRecvReplconf(conn, &err);
+        if (ret != C_OK) break;
+        server.repl_sibling_channel_state = REPL_SIBLING_SEND_PSYNC;
+        /* fall through */
+
+    case REPL_SIBLING_SEND_PSYNC:
+        ret = siblingHandleSendPsync(conn, &err);
+        if (ret == C_OK) server.repl_sibling_channel_state = REPL_SIBLING_RECV_PSYNC;
+        break;
+
+    case REPL_SIBLING_RECV_PSYNC:
+        ret = siblingHandleRecvPsync(conn, &err);
+        /* C_OK: BIO started, main channel resumed. C_RETRY: wait for more data. */
+        if (ret == C_RETRY) {
+            sdsfree(err);
+            return;
+        }
+        break;
+
+    default:
+        serverPanic("Unexpected sibling channel state: %d", server.repl_sibling_channel_state);
+    }
+
+    if (ret == C_ERR) goto error;
+    sdsfree(err);
+    return;
+
+error:
+    if (err) {
+        serverLog(LL_WARNING, "Sync-from-replica: sibling handshake failed: %s", err);
+        sdsfree(err);
+    }
+    replicationAbortSiblingSync();
+    cancelReplicationHandshake(1);
+}
+
+/* Clear the sibling sync guard flag and address fields.
+ * Does NOT close connections or files — use replicationAbortSiblingSync for full cleanup. */
+void clearSiblingSyncState(void) {
+    server.cluster_syncing_from_sibling = 0;
+    server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
+    server.repl_sibling_channel_state = REPL_SIBLING_NONE;
+    memset(&server.repl_provisional_primary, 0, sizeof(server.repl_provisional_primary));
+    sdsfree(server.sync_sibling_host);
+    server.sync_sibling_host = NULL;
+    server.sync_sibling_port = 0;
+}
+
+/* Clear sibling state and redirect server.primary_host to the real primary
+ * from cluster topology.  Used by timeout/disconnection handlers that need to
+ * fall back to syncing from P instead of S. */
+void siblingFallbackToPrimary(void) {
+    /* Abort sibling transfer first (drains BIO, frees buffers, clears state).
+     * Must happen BEFORE redirecting primary_host so cancelReplicationHandshake
+     * can still see the dual-channel state for proper teardown. */
+    replicationAbortSiblingSync();
+    if (server.cluster_enabled) {
+        clusterNode *pn = server.cluster->myself->replicaof;
+        if (pn) {
+            sdsfree(server.primary_host);
+            server.primary_host = sdsnew(pn->ip);
+            server.primary_port = getNodeDefaultReplicationPort(pn);
+        }
+    }
+}
+
+/* Abort an in-progress sibling RDB transfer.  Cleans up the connection,
+ * temp file, and guard flag. Safe to call even if no sibling sync is active.
+ * Uses the standard repl_rdb_transfer_s / repl_transfer_fd / repl_transfer_tmpfile
+ * fields which are shared with the normal sync path. */
+void replicationAbortSiblingSync(void) {
+    /* Signal BIO to abort, then drain.  Without the abort flag the main
+     * thread can block until the download naturally finishes. */
+    if (bioPendingJobsOfType(BIO_RDB_SAVE)) {
+        server.replica_bio_abort_save = 1;
+        bioDrainWorker(BIO_RDB_SAVE);
+        server.replica_bio_abort_save = 0;
+    }
+    resetBioRDBSaveState();
+
+    if (server.repl_rdb_transfer_s) {
+        connClose(server.repl_rdb_transfer_s);
+        server.repl_rdb_transfer_s = NULL;
+    }
+    if (server.repl_transfer_fd != -1) {
+        close(server.repl_transfer_fd);
+        server.repl_transfer_fd = -1;
+    }
+    if (server.repl_transfer_tmpfile) {
+        bg_unlink(server.repl_transfer_tmpfile);
+        zfree(server.repl_transfer_tmpfile);
+        server.repl_transfer_tmpfile = NULL;
+    }
+    /* Free buffered data if dualChannelSyncHandlePsync already initialized it. */
+    if (server.pending_repl_data.blocks) freePendingReplDataBuf();
+    if (server.cluster_syncing_from_sibling) {
+        serverLog(LL_NOTICE,
+                  "Sync-from-replica: sibling sync aborted, clearing guard flag");
+    }
+    clearSiblingSyncState();
+}
+
+/* Open the sibling RDB side-channel.  Creates an async connection to
+ * the sibling replica.  The siblingRdbChannelHandler state machine
+ * when the TCP connection is established.  Note: TLS negotiation happens
+ * asynchronously after TCP connect; the handler uses connBlock() +
+ * connRecvTimeout() for the synchronous handshake which implicitly
+ * The siblingRdbChannelHandler state machine handles TLS handshake
+ * events asynchronously before proceeding with the REPLCONF/PSYNC
+ * handshake. */
+int replicationOpenSiblingRdbChannel(char *host, int port) {
+    server.repl_rdb_transfer_s = connCreate(connTypeOfReplication());
+    server.repl_sibling_channel_state = REPL_SIBLING_SEND_HANDSHAKE;
+    if (connConnect(server.repl_rdb_transfer_s, host, port,
+                    server.bind_source_addr, server.repl_mptcp,
+                    siblingRdbChannelHandler) == C_ERR) {
+        serverLog(LL_WARNING,
+                  "Sync-from-replica: can't connect to sibling %s:%d: %s",
+                  host, port, connGetLastError(server.repl_rdb_transfer_s));
+        connClose(server.repl_rdb_transfer_s);
+        server.repl_rdb_transfer_s = NULL;
+        server.repl_sibling_channel_state = REPL_SIBLING_NONE;
+        return C_ERR;
+    }
+    serverLog(LL_NOTICE,
+              "Sync-from-replica: opening RDB channel to sibling %s:%d", host, port);
+    return C_OK;
 }
 
 /* Replication: Primary side.
@@ -3231,6 +3592,27 @@ error:
     server.repl_state = REPL_STATE_CONNECT;
 }
 
+/* Remove stale temp-*-repl.buf spill files left behind by a previous crash.
+ * Called once at startup. The filename includes the PID, so after a restart
+ * the old PID's file is orphaned. */
+void removeStaleReplSpillFiles(void) {
+    glob_t g;
+    if (glob("temp-*-repl.buf", GLOB_NOSORT, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            /* Extract PID from filename (temp-<pid>-repl.buf) and
+             * only remove if that process is no longer alive. */
+            long pid = 0;
+            if (sscanf(g.gl_pathv[i], "temp-%ld-", &pid) == 1 && pid > 0) {
+                if (kill((pid_t)pid, 0) == 0) continue; /* Process alive, skip */
+            }
+            serverLog(LL_NOTICE,
+                      "Removing stale replication spill file: %s", g.gl_pathv[i]);
+            unlink(g.gl_pathv[i]);
+        }
+        globfree(&g);
+    }
+}
+
 /* Replication: Replica side.
  * Initialize server.pending_repl_data infrastructure, we will allocate the buffer
  * itself once we need it */
@@ -3239,6 +3621,12 @@ void replDataBufInit(void) {
     server.pending_repl_data.mem = 0;
     server.pending_repl_data.len = 0;
     server.pending_repl_data.peak = 0;
+    server.pending_repl_data.spill_fd = -1;
+    server.pending_repl_data.spill_tmpfile = NULL;
+    server.pending_repl_data.spill_written = 0;
+    server.pending_repl_data.spill_read = 0;
+    server.pending_repl_data.spill_fsync_off = 0;
+    server.pending_repl_data.mem_limit = server.repl_sync_buffer_mem_limit;
     server.pending_repl_data.blocks = listCreate();
     server.pending_repl_data.blocks->free = zfree;
 }
@@ -3283,10 +3671,84 @@ int readIntoReplDataBlock(connection *conn, replDataBufBlock *data_block, size_t
 }
 
 /* Replication: Replica side.
- * Read handler for buffering incoming repl data during RDB download/loading. */
+ * Open (or reuse) the disk-spill temp file for pending_repl_data. Returns C_OK
+ * on success, C_ERR on failure. */
+static int replDataBufOpenSpillFile(void) {
+    if (server.pending_repl_data.spill_fd != -1) return C_OK;
+    char tmpfile[256];
+    snprintf(tmpfile, sizeof(tmpfile), "temp-%d-repl.buf", (int)getpid());
+    int fd = open(tmpfile, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd == -1) {
+        serverLog(LL_WARNING, "Sync-from-replica: failed to open spill file %s: %s",
+                  tmpfile, strerror(errno));
+        return C_ERR;
+    }
+    server.pending_repl_data.spill_fd = fd;
+    server.pending_repl_data.spill_tmpfile = zstrdup(tmpfile);
+    server.pending_repl_data.spill_written = 0;
+    server.pending_repl_data.spill_read = 0;
+    server.pending_repl_data.spill_fsync_off = 0;
+    serverLog(LL_NOTICE, "Sync-from-replica: opened disk-spill file %s", tmpfile);
+    return C_OK;
+}
+
+/* Replication: Replica side.
+ * Write data to the disk-spill file. Returns C_OK on success, C_ERR on failure
+ * (caller should abort the sync). */
+static int replDataBufSpillWrite(const char *buf, size_t len) {
+    ssize_t nwritten = write(server.pending_repl_data.spill_fd, buf, len);
+    if (nwritten != (ssize_t)len) {
+        serverLog(LL_WARNING, "Sync-from-replica: disk-spill write error: %s",
+                  (nwritten == -1) ? strerror(errno) : "short write");
+        return C_ERR;
+    }
+    server.pending_repl_data.spill_written += nwritten;
+    server.pending_repl_data.len += nwritten;
+    if (server.pending_repl_data.peak < server.pending_repl_data.len)
+        server.pending_repl_data.peak = server.pending_repl_data.len;
+    /* Periodic fsync every REPL_MAX_WRITTEN_BEFORE_FSYNC (8MB). */
+    if (server.pending_repl_data.spill_written -
+            server.pending_repl_data.spill_fsync_off >=
+        REPL_MAX_WRITTEN_BEFORE_FSYNC) {
+        off_t sync_size = server.pending_repl_data.spill_written -
+                          server.pending_repl_data.spill_fsync_off;
+        rdb_fsync_range(server.pending_repl_data.spill_fd,
+                        server.pending_repl_data.spill_fsync_off, sync_size);
+        server.pending_repl_data.spill_fsync_off += sync_size;
+    }
+    return C_OK;
+}
+
+/* Replication: Replica side.
+ * Read handler for buffering incoming repl data during RDB download/loading.
+ * When syncing from a sibling replica and memory exceeds the configured limit,
+ * data spills to a temp file on disk instead of stopping reads. */
 void bufferReplData(connection *conn) {
+    char spillbuf[PROTO_IOBUF_LEN];
     size_t readlen = PROTO_IOBUF_LEN;
     int remaining_bytes = 0;
+
+    /* Keep transfer timeout from firing while we're actively buffering. */
+    server.repl_transfer_lastio = server.unixtime;
+
+    /* Fast path: if already spilling to disk, read directly to the spill file. */
+    if (server.pending_repl_data.spill_fd != -1) {
+        int nread = connRead(conn, spillbuf, readlen);
+        if (nread <= 0) {
+            if (nread == 0 || connGetState(conn) != CONN_STATE_CONNECTED) {
+                dualChannelServerLog(LL_WARNING, "Provisional primary closed connection");
+                if (server.loading_rio) rioCloseASAP(server.loading_rio);
+                cancelReplicationHandshake(1);
+            }
+            return;
+        }
+        server.stat_total_reads_processed++;
+        if (replDataBufSpillWrite(spillbuf, nread) == C_ERR) {
+            if (server.loading_rio) rioCloseASAP(server.loading_rio);
+            cancelReplicationHandshake(1);
+        }
+        return;
+    }
 
     while (readlen > 0) {
         listNode *ln = listLast(server.pending_repl_data.blocks);
@@ -3300,7 +3762,35 @@ void bufferReplData(connection *conn) {
             remaining_bytes = readIntoReplDataBlock(conn, tail, remaining_bytes);
         }
         if (readlen && remaining_bytes == 0) {
-            if (server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes &&
+            /* Check if we should spill to disk (sync-from-replica) or stop reads
+             * (original same-server dual-channel behavior). */
+            int mem_exceeded = server.pending_repl_data.mem_limit &&
+                               server.pending_repl_data.mem > server.pending_repl_data.mem_limit;
+            if (mem_exceeded && server.cluster_syncing_from_sibling) {
+                /* Transition to disk-spill: open temp file and redirect remaining data. */
+                if (replDataBufOpenSpillFile() == C_ERR) {
+                    cancelReplicationHandshake(1);
+                    return;
+                }
+                int nread = connRead(conn, spillbuf, readlen);
+                if (nread <= 0) {
+                    if (nread == 0 || connGetState(conn) != CONN_STATE_CONNECTED) {
+                        dualChannelServerLog(LL_WARNING, "Provisional primary closed connection");
+                        if (server.loading_rio) rioCloseASAP(server.loading_rio);
+                        cancelReplicationHandshake(1);
+                    }
+                    return;
+                }
+                server.stat_total_reads_processed++;
+                if (replDataBufSpillWrite(spillbuf, nread) == C_ERR) {
+                    if (server.loading_rio) rioCloseASAP(server.loading_rio);
+                    cancelReplicationHandshake(1);
+                    return;
+                }
+                break; /* Next call enters the fast spill path at the top. */
+            }
+            if (!server.cluster_syncing_from_sibling &&
+                server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes &&
                 server.pending_repl_data.len > server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes) {
                 dualChannelServerLog(LL_NOTICE,
                                      "Replication buffer limit reached (%llu bytes), stopping buffering. "
@@ -3341,13 +3831,16 @@ void bufferReplData(connection *conn) {
 }
 
 /* Replication: Replica side.
- * Streams accumulated replication data into the database while freeing read nodes */
+ * Streams accumulated replication data into the database while freeing read nodes.
+ * Drains memory blocks first, then the disk-spill file if one exists. */
 int streamReplDataBufToDb(client *c) {
     serverAssert(c->flag.primary);
     blockingOperationStarts();
     size_t used, offset = 0;
     listNode *cur = NULL;
     time_t last_progress_callback = mstime();
+
+    /* Phase 1: drain in-memory blocks. */
     while (server.pending_repl_data.blocks && (cur = listFirst(server.pending_repl_data.blocks))) {
         /* Read and process repl data block */
         replDataBufBlock *o = listNodeValue(cur);
@@ -3361,14 +3854,71 @@ int streamReplDataBufToDb(client *c) {
         listDelNode(server.pending_repl_data.blocks, cur);
         replStreamProgressCallback(offset, used, &last_progress_callback);
     }
-    blockingOperationEnds();
-    if (!server.pending_repl_data.blocks) {
-        /* If we encounter a `replicaof` command during the replStreamProgressCallback,
-         * pending_repl_data.blocks will be NULL, and we should return an error and
-         * abort the current sync session. */
-        return C_ERR;
+
+    /* Check if the list was destroyed during processEventsWhileBlocked. */
+    if (!server.pending_repl_data.blocks) goto aborted;
+
+    /* Phase 2: drain disk-spill file if one exists. */
+    if (server.pending_repl_data.spill_fd != -1 &&
+        server.pending_repl_data.spill_written > 0) {
+        /* Close the write fd and reopen for reading. */
+        close(server.pending_repl_data.spill_fd);
+        server.pending_repl_data.spill_fd = -1;
+
+        int rfd = open(server.pending_repl_data.spill_tmpfile, O_RDONLY);
+        if (rfd == -1) {
+            serverLog(LL_WARNING,
+                      "Sync-from-replica: failed to reopen spill file for reading: %s",
+                      strerror(errno));
+            blockingOperationEnds();
+            return C_ERR;
+        }
+
+        char buf[PROTO_IOBUF_LEN];
+        off_t remaining = server.pending_repl_data.spill_written -
+                          server.pending_repl_data.spill_read;
+        while (remaining > 0) {
+            size_t toread = (size_t)remaining < sizeof(buf) ? (size_t)remaining : sizeof(buf);
+            ssize_t nread = read(rfd, buf, toread);
+            if (nread <= 0) {
+                serverLog(LL_WARNING,
+                          "Sync-from-replica: spill file read error: %s",
+                          (nread == 0) ? "unexpected EOF" : strerror(errno));
+                close(rfd);
+                blockingOperationEnds();
+                return C_ERR;
+            }
+            c->querybuf = sdscatlen(c->querybuf, buf, nread);
+            c->repl_data->read_reploff += nread;
+            processInputBuffer(c);
+            server.pending_repl_data.spill_read += nread;
+            server.pending_repl_data.len -= nread;
+            remaining -= nread;
+            offset += nread;
+            server.repl_transfer_lastio = server.unixtime;
+            replStreamProgressCallback(offset, nread, &last_progress_callback);
+
+            /* Check if a replicaof command aborted the session. */
+            if (!server.pending_repl_data.blocks) {
+                close(rfd);
+                goto aborted;
+            }
+        }
+        close(rfd);
+        serverLog(LL_NOTICE,
+                  "Sync-from-replica: drained %lld bytes from disk-spill file",
+                  (long long)server.pending_repl_data.spill_written);
     }
+
+    blockingOperationEnds();
     return C_OK;
+
+aborted:
+    blockingOperationEnds();
+    /* If we encounter a `replicaof` command during the replStreamProgressCallback,
+     * pending_repl_data.blocks will be NULL, and we should return an error and
+     * abort the current sync session. */
+    return C_ERR;
 }
 
 /* Replication: Replica side.
@@ -3395,6 +3945,13 @@ void dualChannelSyncSuccess(void) {
     replicationSendAck(); /* Send ACK to notify primary that replica is synced */
     server.rdb_client_id = -1;
     server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
+
+    /* Sync-from-replica: final cleanup of the guard flag now that both
+     * channels are done and steady state is established. */
+    if (server.cluster_syncing_from_sibling) {
+        serverLog(LL_NOTICE, "Sync-from-replica: complete, steady-state replication from primary");
+        clearSiblingSyncState();
+    }
 }
 
 /* Replication: Replica side.
@@ -4176,6 +4733,27 @@ void syncWithPrimary(connection *conn) {
      * reconnection attempt. */
     case REPL_STATE_SEND_PSYNC:
     case_send_psync:
+        /* If syncing from sibling, delay PSYNC until the sibling RDB channel
+         * provides the replid+offset via +FULLRESYNC.  The sibling handler
+         * (siblingRdbChannelHandler) stores the offset in
+         * repl_provisional_primary and sets repl_rdb_channel_state to
+         * REPL_DUAL_CHANNEL_RDB_LOAD, then calls syncWithPrimary to resume. */
+        if (server.cluster_syncing_from_sibling &&
+            server.repl_rdb_channel_state == REPL_DUAL_CHANNEL_STATE_NONE) {
+            /* If sibling channel is gone (error/abort), clear the guard
+             * and fall through to normal PSYNC instead of stalling. */
+            if (server.repl_rdb_transfer_s == NULL &&
+                server.repl_sibling_channel_state == REPL_SIBLING_NONE) {
+                serverLog(LL_NOTICE,
+                          "Sync-from-replica: sibling gone, falling back to normal PSYNC");
+                clearSiblingSyncState();
+            } else {
+                serverLog(LL_NOTICE,
+                          "Sync-from-replica: pausing PSYNC to primary, "
+                          "waiting for sibling +FULLRESYNC offset");
+                return;
+            }
+        }
         if (syncWithPrimaryHandleSendPsyncState(conn) == C_ERR) {
             syncWithPrimaryHandleError(&conn);
             return;
@@ -4228,7 +4806,42 @@ void syncWithPrimary(connection *conn) {
             serverCommunicateSystemd("STATUS=PRIMARY <-> REPLICA sync: Partial Resynchronization accepted. Ready to "
                                      "accept connections in read-write mode.\n");
         }
+
+        /* Sync-from-replica: P accepted partial resync.  The sibling RDB is
+         * still downloading (or loading).  Install bufferReplData on the main
+         * channel so P's incremental stream is buffered in pending_repl_data
+         * until the sibling RDB load completes and we can drain the buffer.
+         * dualChannelSyncHandlePsync handles this: it checks whether the RDB
+         * is loaded yet and either installs the buffer handler or transitions
+         * to steady state. */
+        if (server.cluster_syncing_from_sibling &&
+            server.repl_rdb_channel_state != REPL_DUAL_CHANNEL_STATE_NONE) {
+            serverLog(LL_NOTICE,
+                      "Sync-from-replica: installing bufferReplData on main channel "
+                      "to buffer primary stream during sibling RDB load");
+            if (dualChannelSyncHandlePsync() == C_ERR) {
+                return;
+            }
+            /* Only advance to TRANSFER if sync didn't already complete
+             * inline (RDB_LOADED path calls dualChannelSyncSuccess directly).
+             * Setting TRANSFER after steady state would corrupt the state. */
+            if (server.repl_rdb_channel_state != REPL_DUAL_CHANNEL_STATE_NONE) {
+                server.repl_state = REPL_STATE_TRANSFER;
+            }
+        }
         return;
+    }
+
+    /* P1: If primary responded with FULLRESYNC while we have a sibling sync
+     * in progress, abort the sibling transfer first.  Both flows share
+     * repl_transfer_fd/tmpfile and the RDB load state machine, so letting
+     * them run concurrently would corrupt the sync state. */
+    if (server.cluster_syncing_from_sibling &&
+        (psync_result == PSYNC_FULLRESYNC || psync_result == PSYNC_FULLRESYNC_DUAL_CHANNEL)) {
+        serverLog(LL_WARNING,
+                  "Sync-from-replica: primary responded FULLRESYNC (backlog insufficient), "
+                  "aborting sibling sync and falling back to full sync from primary");
+        replicationAbortSiblingSync();
     }
 
     /* Fall back to SYNC if needed. Otherwise psync_result == PSYNC_FULLRESYNC
@@ -4407,6 +5020,14 @@ int cancelReplicationHandshake(int reconnect) {
         server.repl_state = REPL_STATE_CONNECT;
     } else {
         return 0;
+    }
+
+    /* Sync-from-replica: if we were syncing from a sibling, redirect to the
+     * real primary before reconnecting.  Centralised here so every caller
+     * (timeout, abort, topology change) goes through one path. */
+    if (server.cluster_syncing_from_sibling && server.cluster_enabled) {
+        serverLog(LL_NOTICE, "Sync-from-replica: aborting sibling sync, falling back to primary");
+        siblingFallbackToPrimary();
     }
 
     if (!reconnect) return 1;
