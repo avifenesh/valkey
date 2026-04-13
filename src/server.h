@@ -1075,10 +1075,10 @@ typedef struct replBacklog {
 } replBacklog;
 
 typedef struct replDataBuf {
-    list *blocks; /* List of replDataBufBlock */
-    size_t mem;   /* Total allocated memory including buffer metadata and list nodes */
-    size_t len;   /* Total replication data bytes pending processing */
-    size_t peak;  /* Peak value of len during buffer lifetime */
+    list *blocks;          /* List of replDataBufBlock */
+    size_t mem;            /* Total allocated memory including buffer metadata and list nodes */
+    size_t len;            /* Total replication data bytes pending processing */
+    size_t peak;           /* Peak value of len during buffer lifetime */
 } replDataBuf;
 
 typedef struct {
@@ -2131,6 +2131,8 @@ struct valkeyServer {
                                                  * delay (start sooner if they all connect). */
     int dual_channel_replication;               /* Config used to determine if the replica should
                                                  * use dual channel replication for full syncs. */
+    int repl_prefer_sync_from_replica;          /* Enable sync-from-replica optimization. */
+    int cluster_syncing_from_sibling;           /* Guard flag: syncing from sibling replica in progress. */
     _Atomic(int) replica_bio_disk_save_state;   /* Flag set by the bio thread to indicate that the
                                                  * RDB save to disk has completed, or failed */
     _Atomic(bool) replica_bio_abort_save;       /* Flag set by main thread, used to signal to replica's
@@ -3183,6 +3185,9 @@ void freeReplicaReferencedReplBuffer(client *replica);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
 void updateReplicasWaitingBgsave(int bgsaveerr, int type);
 void replicationCron(void);
+void replicationAbortSiblingSync(void);
+int cancelReplicationHandshake(int reconnect);
+int connectWithPrimary(void);
 void replicationStartPendingFork(void);
 void replicationHandlePrimaryDisconnection(void);
 void replicationCachePrimary(client *c);

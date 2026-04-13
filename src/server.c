@@ -2381,6 +2381,7 @@ void initServerConfig(void) {
     server.primary_initial_offset = -1;
     server.repl_state = REPL_STATE_NONE;
     server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
+    server.cluster_syncing_from_sibling = 0;
     server.repl_transfer_tmpfile = NULL;
     server.repl_transfer_fd = -1;
     server.repl_transfer_s = NULL;
@@ -3114,7 +3115,6 @@ void initServer(void) {
     commandlogInit();
     latencyMonitorInit();
     initSharedQueryBuf();
-
     /* Initialize ACL default password if it exists */
     ACLUpdateDefaultUserPassword(server.requirepass);
 
@@ -6612,7 +6612,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_active:%d\r\n", server.repl_backlog != NULL,
                 "repl_backlog_size:%lld\r\n", server.repl_backlog_size,
                 "repl_backlog_first_byte_offset:%lld\r\n", server.repl_backlog ? server.repl_backlog->offset : 0,
-                "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
+                "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0,
+                "sync_from_replica_in_progress:%d\r\n", server.cluster_syncing_from_sibling,
+                "sync_from_replica_phase:%s\r\n", server.cluster_syncing_from_sibling ? (server.repl_state == REPL_STATE_TRANSFER ? "rdb_transfer" : (server.repl_state >= REPL_STATE_CONNECTING && server.repl_state < REPL_STATE_TRANSFER) ? "handshake"
+                                                                                                                                                                                                                                             : "rdb_loading")
+                                                                                      : "none"));
     }
 
     /* CPU */
