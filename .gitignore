@@ -58,3 +58,8 @@ cmake-build-debug/
 cmake-build-release/
 __pycache__
 src/unit/.flags
+.coordination/
+.claude/
+tests/tmp/
+Dockerfile.bench
+k8s-bench/
