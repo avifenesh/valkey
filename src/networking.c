@@ -37,6 +37,7 @@
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
 #include "io_threads.h"
+#include "workload_trace.h"
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
@@ -352,6 +353,7 @@ client *createClient(connection *conn) {
     c->bstate = NULL;
     c->pubsub_data = NULL;
     c->module_data = NULL;
+    c->workload_tracer_config = NULL;
     c->mstate = NULL;
     c->woff = 0;
     c->peerid = NULL;
@@ -2060,6 +2062,10 @@ void clearClientConnectionState(client *c) {
     serverAssert(!(c->flag.replica || c->flag.primary || c->slot_migration_job));
 
     if (c->flag.tracking) disableTracking(c);
+
+    /* Clean up workload tracer subscription */
+    workloadTraceDetachClient(c);
+
     selectDb(c, 0);
 #ifdef LOG_REQ_RES
     c->resp = server.client_default_resp;
@@ -2164,6 +2170,9 @@ int freeClient(client *c) {
 
     freeClientBlockingState(c);
     freeClientPubSubData(c);
+
+    /* Clean up workload tracer subscription */
+    workloadTraceDetachClient(c);
 
     /* Free data structures. */
     releaseReplyReferences(c);
