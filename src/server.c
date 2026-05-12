@@ -2947,6 +2947,7 @@ void initServer(void) {
     server.tracking_pending_keys = listCreate();
     server.pending_push_messages = listCreate();
     server.clients_waiting_acks = listCreate();
+    server.clients_pending_async_unblock = listCreate();
     server.get_ack_from_replicas = 0;
     server.paused_actions = 0;
     memset(server.client_pause_per_purpose, 0, sizeof(server.client_pause_per_purpose));
@@ -4761,6 +4762,9 @@ int prepareForShutdown(client *c, int flags) {
         serverLog(LL_NOTICE, "User requested shutdown...");
     }
     if (server.supervised_mode == SUPERVISED_SYSTEMD) serverCommunicateSystemd("STOPPING=1\n");
+
+    /* Allow the cluster protocol to initiate graceful handoff (e.g. leader transfer). */
+    if (server.cluster_enabled) clusterPrepareShutdown();
 
     /* If we have any replicas, let them catch up the replication offset before
      * we shut down, to avoid data loss. */

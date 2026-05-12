@@ -133,11 +133,11 @@ proc test_migrated_replica {type} {
     }
 } ;# proc
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_migrated_replica "shutdown"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_migrated_replica "sigstop"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
@@ -228,11 +228,11 @@ proc test_nonempty_replica {type} {
     }
 } ;# proc
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_nonempty_replica "shutdown"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_nonempty_replica "sigstop"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
@@ -356,11 +356,11 @@ proc test_sub_replica {type} {
     }
 }
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_sub_replica "shutdown"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_sub_replica "sigstop"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
@@ -406,15 +406,15 @@ proc test_cluster_setslot {type} {
     }
 }
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_cluster_setslot "gossip"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
-start_cluster 4 4 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 4 4 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test_cluster_setslot "setslot"
 } my_slot_allocation cluster_allocate_replicas ;# start_cluster
 
-start_cluster 3 0 {tags {external:skip cluster} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
+start_cluster 3 0 {tags {external:skip cluster cluster-v2:skip} overrides {cluster-node-timeout 1000 cluster-migration-barrier 999}} {
     test "Empty primary will check and delete the dirty slots" {
         R 2 config set cluster-allow-replica-migration no
 
@@ -437,7 +437,7 @@ start_cluster 3 0 {tags {external:skip cluster} overrides {cluster-node-timeout 
 # Replica migration test.
 # Check that orphaned primaries are joined by replicas of primaries having
 # multiple replicas attached, according to the migration barrier settings.
-start_cluster 5 10 {tags {external:skip cluster} overrides {shutdown-timeout 0}} {
+start_cluster 5 10 {tags {external:skip cluster cluster-v2:skip} overrides {shutdown-timeout 0}} {
     # Killing all the replicas of primary #0 and #1
     pause_process [srv -5 pid]
     pause_process [srv -10 pid]
@@ -473,7 +473,7 @@ start_cluster 5 10 {tags {external:skip cluster} overrides {shutdown-timeout 0}}
 
 # Now test the migration to a primary which used to be a replica, after
 # a failover.
-start_cluster 5 10 {tags {external:skip cluster} overrides {shutdown-timeout 0}} {
+start_cluster 5 10 {tags {external:skip cluster cluster-v2:skip} overrides {shutdown-timeout 0}} {
     test "Primary #12 should get at least one migrated replica" {
         # Kill replica #7 of primary #2. Only replica left is #12 now"
         pause_process [srv -7 pid]

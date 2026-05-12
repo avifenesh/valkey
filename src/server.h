@@ -346,6 +346,7 @@ typedef enum blocking_type {
     BLOCKED_ZSET,     /* BZPOP et al. */
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
+    BLOCKED_ASYNC,    /* Waiting for async completion callback (e.g. Raft commit). */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
@@ -643,6 +644,12 @@ typedef enum {
     CLUSTER_CONFIGFILE_SAVE_BEHAVIOR_SYNC = 0,    /* Perform a synchronous save, exit the process if it fails. */
     CLUSTER_CONFIGFILE_SAVE_BEHAVIOR_BEST_EFFORT, /* Attempt to save on a "best-effort" basis, process will not exit if it fails. */
 } cluster_persist_config_mode;
+
+/* Cluster bus protocol. */
+enum {
+    CLUSTER_PROTOCOL_GOSSIP = 0,
+    CLUSTER_PROTOCOL_RAFT,
+};
 
 /* RDB active child save type. */
 #define RDB_CHILD_TYPE_NONE 0
@@ -2202,8 +2209,9 @@ struct valkeyServer {
     /* Import Mode */
     int import_mode; /* If true, server is in import mode and forbid expiration and eviction. */
     /* Synchronous replication. */
-    list *clients_waiting_acks; /* Clients waiting in WAIT or WAITAOF. */
-    int get_ack_from_replicas;  /* If true we send REPLCONF GETACK. */
+    list *clients_waiting_acks;          /* Clients waiting in WAIT or WAITAOF. */
+    list *clients_pending_async_unblock; /* BLOCKED_ASYNC clients to unblock in beforeSleep. */
+    int get_ack_from_replicas;           /* If true we send REPLCONF GETACK. */
     /* Limits */
     unsigned int maxclients;                    /* Max number of simultaneous clients */
     unsigned long long maxmemory;               /* Max number of memory bytes to use */
@@ -2264,6 +2272,7 @@ struct valkeyServer {
     unsigned int watching_clients; /* # of clients are watching keys */
     /* Cluster */
     int cluster_enabled;                                   /* Is cluster enabled? */
+    int cluster_protocol;                                  /* Cluster bus protocol (gossip or raft). */
     int cluster_port;                                      /* Set the cluster port for a node. */
     mstime_t cluster_node_timeout;                         /* Cluster node timeout. */
     mstime_t cluster_ping_interval;                        /* A debug configuration for setting how often cluster nodes send ping messages. */
@@ -3882,6 +3891,10 @@ void handleClientsBlockedOnKeys(void);
 void signalKeyAsReady(serverDb *db, robj *key, int type);
 void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, int unblock_on_nokey);
 void blockClientShutdown(client *c);
+typedef struct blockedAsyncHandle blockedAsyncHandle;
+blockedAsyncHandle *blockClientAsync(client *c);
+client *consumeBlockedClientAsyncHandle(blockedAsyncHandle *handle);
+void unblockClientAsync(client *c);
 void blockPostponeClient(client *c);
 void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, long numreplicas, int numlocal);
 void replicationRequestAckFromReplicas(void);
