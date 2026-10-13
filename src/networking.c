@@ -4566,6 +4566,7 @@ static int addKeysToIncrFindBatch(client *c,
                                   struct serverCommand *cmd,
                                   robj **argv,
                                   int argc,
+                                  int slot,
                                   hashtableIncrementalFindState *incr_states,
                                   int num,
                                   int max) {
@@ -4575,8 +4576,14 @@ static int addKeysToIncrFindBatch(client *c,
     if (numkeys) {
         int kvstore_idx = 0;
         if (server.cluster_enabled) {
-            robj *first_key = argv[result.keys[0].pos];
-            kvstore_idx = keyHashSlot(objectGetVal(first_key), sdslen(objectGetVal(first_key)));
+            /* prepareCommandGeneric() already hashed the first key. The slot is
+             * -1 only for cross-slot commands, which still hash the first key here. */
+            if (slot >= 0) {
+                kvstore_idx = slot;
+            } else {
+                robj *first_key = argv[result.keys[0].pos];
+                kvstore_idx = keyHashSlot(objectGetVal(first_key), sdslen(objectGetVal(first_key)));
+            }
         }
         hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
         if (ht != NULL) {
@@ -4607,7 +4614,7 @@ static void prefetchCommandQueueKeys(client *c) {
 
     /* If the command is valid, add keys to incremental find batch. */
     if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
-        num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc,
+        num_keys = addKeysToIncrFindBatch(c, c->parsed_cmd, c->argv, c->argc, c->slot,
                                           key_incr_states, num_keys, max_keys);
     } else {
         /* Command is already found to be incomplete, non-existing, etc. */
@@ -4630,7 +4637,7 @@ static void prefetchCommandQueueKeys(client *c) {
                               (p->read_flags & READ_FLAGS_BAD_ARITY));
             continue;
         }
-        num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc,
+        num_keys = addKeysToIncrFindBatch(c, p->cmd, p->argv, p->argc, p->slot,
                                           key_incr_states, num_keys, max_keys);
     }
     if (num_keys <= 1) return; /* No point to prefetch a single key */
