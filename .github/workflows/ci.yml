@@ -249,6 +249,8 @@ jobs:
         # Build with additional upcoming features
         run: |
           make -j3 all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_ZSTD=yes USE_LIBBACKTRACE=yes LIBBACKTRACE_PREFIX=/usr/local
+      - name: Build example modules with the selected SDK
+        run: make -C src/modules -j3
       - name: unit tests
         run: |
           make test-unit
