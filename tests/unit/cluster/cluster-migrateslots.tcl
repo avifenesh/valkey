@@ -87,6 +87,25 @@ proc wait_for_migration {node_idx slot {maxtries 100}} {
     wait_for_cluster_propagation
 }
 
+# Keep the asynchronous startup-cancellation sequence intact and report
+# both endpoints if the repeated AOF migration check fails.
+proc wait_for_migration_diagnostic {node_idx slot context} {
+    try {
+        wait_for_migration $node_idx $slot
+    } on error {message options} {
+        foreach role {source target} {
+            set node [dict get $context $role]
+            foreach {key command} {migrations {CLUSTER GETSLOTMIGRATIONS} persistence {INFO PERSISTENCE}} {
+                if {[catch {R $node {*}$command} value]} {
+                    set value [dict create error $value]
+                }
+                dict set context ${role}_$key $value
+            }
+        }
+        return -options $options "$message\nMigration diagnostics: $context"
+    }
+}
+
 # Ensure that a given hash slot is served by the specified node.
 # If the slot is currently owned by a different node, move it to the target
 # and wait for the migration to complete.
@@ -2707,10 +2726,10 @@ start_cluster 3 3 {tags {logreqres:skip external:skip cluster aofrw network} ove
                 lassign $migration_pair slotranges source_idx target_idx source_id target_id
                 # Slot 16383: Node 2 -> Node 0 (success)
                 assert_match "OK" [R $source_idx CLUSTER MIGRATESLOTS SLOTSRANGE {*}$slotranges NODE $target_id]
-                wait_for_migration $target_idx [lindex $slotranges 0]
+                wait_for_migration_diagnostic $target_idx [lindex $slotranges 0] [dict create iteration $i ranges $slotranges direction forward source $source_idx target $target_idx]
                 # Slot 16383: Node 0 -> Node 2 (success)
                 assert_match "OK" [R $target_idx CLUSTER MIGRATESLOTS SLOTSRANGE {*}$slotranges NODE $source_id]
-                wait_for_migration $source_idx [lindex $slotranges 0]
+                wait_for_migration_diagnostic $source_idx [lindex $slotranges 0] [dict create iteration $i ranges $slotranges direction reverse source $target_idx target $source_idx]
                 set_debug_prevent_pause 1
                 # Slot 16383: Node 2 -> Node 0 (cancelled)
                 assert_match "OK" [R $source_idx CLUSTER MIGRATESLOTS SLOTSRANGE {*}$slotranges NODE $target_id]
