@@ -139,7 +139,7 @@ typedef struct __attribute__((__packed__)) bulkStrRef {
 
 static void setProtocolError(const char *errstr, client *c);
 static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
-static void trackBufReferences(char *buf, size_t bufpos, client *c);
+static size_t trackBufReferences(char *buf, size_t bufpos, client *c);
 static void releaseBufReferences(char *buf, size_t bufpos, client *c);
 int postponeClientRead(client *c);
 char *getClientSockname(client *c);
@@ -421,6 +421,8 @@ client *createClient(connection *conn) {
     c->net_output_bytes = 0;
     c->net_output_bytes_curr_cmd = 0;
     c->io_tracked_reply_len = 0;
+    c->obuf_accounted_tail = NULL;
+    c->obuf_accounted_tail_header = 0;
     c->commands_processed = 0;
     c->io_last_reply_block = NULL;
     c->io_last_bufpos = 0;
@@ -1201,6 +1203,10 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
      * we return NULL in addReplyDeferredLen() */
     if (node == NULL) return;
     serverAssert(!listNodeValue(ln));
+    if (c->obuf_accounted_tail == ln) {
+        c->obuf_accounted_tail = NULL;
+        c->obuf_accounted_tail_header = 0;
+    }
 
     /* The placeholder node may live in c->deferred_reply when the deferred
      * reply buffer is active.  Use the same list for deletion/accounting. */
@@ -1774,6 +1780,8 @@ void AddReplyFromClient(client *dst, client *src) {
 
     /* Concatenate the reply list into the dest */
     if (listLength(src->reply)) listJoin(dst->reply, src->reply);
+    src->obuf_accounted_tail = NULL;
+    src->obuf_accounted_tail_header = 0;
     dst->reply_bytes += src->reply_bytes;
     src->reply_bytes = 0;
     src->bufpos = 0;
@@ -3313,11 +3321,13 @@ void resetLastWrittenBuf(client *c) {
 /* Track BULK_STR_REF sizes.
  * Calculates reply_len for BULK_STR_REFs if not already set, and adds to client's tracking counter.
  * Called before writing, from either the main thread or an I/O thread. */
-static void trackBufReferences(char *buf, size_t bufpos, client *c) {
+static size_t trackBufReferences(char *buf, size_t bufpos, client *c) {
     serverAssert(c);
 
     char *ptr = buf;
+    size_t last_header = 0;
     while (ptr < buf + bufpos) {
+        last_header = ptr - buf;
         payloadHeader *header = (payloadHeader *)ptr;
         ptr += sizeof(payloadHeader);
 
@@ -3348,6 +3358,7 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
         ptr += header->payload_len;
     }
     serverAssert(ptr == buf + bufpos);
+    return last_header;
 }
 
 /* Account referenced replies before a writer can drain them. Limit checks and
@@ -3370,12 +3381,20 @@ int checkClientOutputBufferLimitsBeforeWrite(client *c) {
         return 0;
 
     if (c->flag.buf_encoded && c->bufpos) trackBufReferences(c->buf, c->bufpos, c);
-    listIter iter;
-    listNode *ln;
-    listRewind(c->reply, &iter);
-    while ((ln = listNext(&iter))) {
+    /* Resume at the last accounted header instead of rescanning the backlog.
+     * Revisit that header because a trailing plain payload may have grown. */
+    listNode *ln = c->obuf_accounted_tail ? c->obuf_accounted_tail : listFirst(c->reply);
+    while (ln) {
         clientReplyBlock *block = listNodeValue(ln);
-        if (block && block->flag.buf_encoded) trackBufReferences(block->buf, block->used, c);
+        if (!block) break; /* A deferred-length placeholder is not ready yet. */
+        size_t offset = ln == c->obuf_accounted_tail ? c->obuf_accounted_tail_header : 0;
+        if (block->flag.buf_encoded) {
+            serverAssert(offset <= block->used);
+            offset += trackBufReferences(block->buf + offset, block->used - offset, c);
+        }
+        c->obuf_accounted_tail = ln;
+        c->obuf_accounted_tail_header = offset;
+        ln = listNextNode(ln);
     }
     return closeClientOnOutputBufferLimitReached(c, 1);
 }
@@ -3419,6 +3438,8 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
 }
 
 void releaseReplyReferences(client *c) {
+    c->obuf_accounted_tail = NULL;
+    c->obuf_accounted_tail_header = 0;
     if (c->bufpos > 0 && c->flag.buf_encoded) {
         releaseBufReferences(c->buf, c->bufpos, c);
     }
@@ -3489,6 +3510,10 @@ static void _postWriteToClient(client *c) {
             c->reply_bytes -= o->size;
             /* If encoded then release references to bulk string objects */
             if (o->flag.buf_encoded) releaseBufReferences(o->buf, o->used, c);
+            if (c->obuf_accounted_tail == next) {
+                c->obuf_accounted_tail = NULL;
+                c->obuf_accounted_tail_header = 0;
+            }
             listDelNode(c->reply, next);
             /* If completely written buffer is last written then reset last written state */
             if (last_written) resetLastWrittenBuf(c);

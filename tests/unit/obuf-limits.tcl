@@ -422,86 +422,101 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         r config set io-threads 1
     }
 
-    test {Copy avoidance spill to reply list returns omem to zero after drain} {
-        r config set min-io-threads-avoid-copy-reply 1
-        r config set io-threads 4
-        r config set commandlog-reply-larger-than 1
-        r config set client-output-buffer-limit {normal 0 0 0}
+    foreach {limits_enabled threads} {0 4 1 1 1 4} {
+        test "Copy avoidance spill drains with limits=$limits_enabled and $threads IO threads" {
+            r config set min-io-threads-avoid-copy-reply 1
+            r config set io-threads $threads
+            set old_always_active [lindex [r config get io-threads-always-active] 1]
+            r config set io-threads-always-active yes
+            r config set commandlog-reply-larger-than 1
+            r config set client-output-buffer-limit {normal 0 0 0}
 
-        set value [string repeat "q" [expr 16*1024]]
-        r set spill_key $value
+            set value [string repeat "q" [expr 16*1024]]
+            r set spill_key $value
 
-        set rd [valkey_deferring_client]
-        $rd client setname spill_omem_test
-        assert_equal "OK" [$rd read]
-        $rd client id
-        set client_id [$rd read]
+            set rd [valkey_deferring_client]
+            $rd client setname spill_omem_test
+            assert_equal "OK" [$rd read]
+            $rd client id
+            set client_id [$rd read]
 
-       
-        # Each pipelined GET for a 16 KB value requires payloadHeader (20 bytes on 64-bit)
-        # and bulkStrRef (16 bytes) in client buf (PROTO_REPLY_CHUNK_BYTES = 16 KB).
-        # 1300 commands * ~36 bytes/header >> 16 KB, so replies spill into c->reply list.
-        # On 32-bit header size is smaller, so we need 3000 commands * ~20 bytes/header >> 16 KB.
-        if {[s arch_bits] == 64} {
-            set cmd_count 1300
-        } else {
-            set cmd_count 3000
-        }
-        set pipeline ""
-        for {set i 0} {$i < $cmd_count} {incr i} {
-            append pipeline "get spill_key\r\n"
-        }
-        $rd write $pipeline
-        $rd flush
 
-        set spilled_to_reply_list 0
-        # Generous budget: valgrind slows IO-thread reply processing 10-50x.
-        for {set i 0} {$i < 200} {incr i} {
-            set oll [get_field_in_client_list $client_id [r client list] oll]
-            if {$oll ne "" && $oll > 0} {
-                set spilled_to_reply_list 1
-                break
+            # Each pipelined GET for a 16 KB value requires payloadHeader (20 bytes on 64-bit)
+            # and bulkStrRef (16 bytes) in client buf (PROTO_REPLY_CHUNK_BYTES = 16 KB).
+            # 1300 commands * ~36 bytes/header >> 16 KB, so replies spill into c->reply list.
+            # On 32-bit header size is smaller, so we need 3000 commands * ~20 bytes/header >> 16 KB.
+            if {[s arch_bits] == 64} {
+                set cmd_count 1300
+            } else {
+                set cmd_count 3000
             }
-            after 100
-        }
-        if {!$spilled_to_reply_list} {
-            fail "Client never spilled copy-avoided replies into c->reply"
-        }
-
-        set reply_len [expr {[string length $value] + [string length [string length $value]] + 5}]
-        set remaining [expr {$reply_len * $cmd_count}]
-        while {$remaining > 0} {
-            set chunk [$rd rawread [expr {min($remaining, 65536)}]]
-            set chunk_len [string length $chunk]
-            if {$chunk_len == 0} {
-                fail "Socket drained unexpectedly after reading [expr {$reply_len * $cmd_count - $remaining}] bytes"
+            set pipeline ""
+            for {set i 0} {$i < $cmd_count} {incr i} {
+                append pipeline "get spill_key\r\n"
             }
-            incr remaining -$chunk_len
-        }
-
-        set fully_drained 0
-        # Generous budget: valgrind slows IO-thread reply processing 10-50x.
-        for {set i 0} {$i < 200} {incr i} {
-            set client_list [r client list]
-            set obl [get_field_in_client_list $client_id $client_list obl]
-            set oll [get_field_in_client_list $client_id $client_list oll]
-            if {$obl ne "" && $oll ne "" && $obl == 0 && $oll == 0} {
-                set fully_drained 1
-                break
+            set reply_len [expr {[string length $value] + [string length [string length $value]] + 5}]
+            if {$limits_enabled} {
+                # Leave room for one full batch and its encoded metadata.
+                r config set client-output-buffer-limit [list normal [expr {2*$reply_len*$cmd_count}] 0 0]
             }
-            after 100
+            foreach round {1 2} {
+                $rd write "${pipeline}ping\r\n"
+                $rd flush
+
+                set spilled_to_reply_list 0
+                # Generous budget: valgrind slows IO-thread reply processing 10-50x.
+                for {set i 0} {$i < 200} {incr i} {
+                    set oll [get_field_in_client_list $client_id [r client list] oll]
+                    if {$oll ne "" && $oll > 0} {
+                        set spilled_to_reply_list 1
+                        break
+                    }
+                    after 100
+                }
+                if {!$spilled_to_reply_list} {
+                    fail "Client never spilled copy-avoided replies into c->reply"
+                }
+
+                # Extend a plain tail while referenced replies are still queued.
+                for {set i 0} {$i < 2} {incr i} {
+                    $rd ping
+                    $rd flush
+                    r client list
+                }
+                set remaining [expr {$reply_len * $cmd_count + 3*7}]
+                while {$remaining > 0} {
+                    set chunk [$rd rawread [expr {min($remaining, 65536)}]]
+                    set chunk_len [string length $chunk]
+                    if {$chunk_len == 0} {
+                        fail "Socket drained unexpectedly after reading [expr {$reply_len * $cmd_count + 3*7 - $remaining}] bytes"
+                    }
+                    incr remaining -$chunk_len
+                }
+
+                set fully_drained 0
+                # Generous budget: valgrind slows IO-thread reply processing 10-50x.
+                for {set i 0} {$i < 200} {incr i} {
+                    set client_list [r client list]
+                    set obl [get_field_in_client_list $client_id $client_list obl]
+                    set oll [get_field_in_client_list $client_id $client_list oll]
+                    if {$obl ne "" && $oll ne "" && $obl == 0 && $oll == 0} {
+                        set fully_drained 1
+                        break
+                    }
+                    after 100
+                }
+                if {!$fully_drained} {
+                    fail "Client reply buffers did not fully drain"
+                }
+
+                assert_equal 0 [get_field_in_client_list $client_id [r client list] omem]
+            }
+
+            $rd close
+            r config set commandlog-reply-larger-than -1
+            r config set min-io-threads-avoid-copy-reply 0
+            r config set io-threads-always-active $old_always_active
+            r config set io-threads 1
         }
-        if {!$fully_drained} {
-            fail "Client reply buffers did not fully drain"
-        }
-
-        set omem [get_field_in_client_list $client_id [r client list] omem]
-
-        $rd close
-        r config set commandlog-reply-larger-than -1
-        r config set min-io-threads-avoid-copy-reply 0
-        r config set io-threads 1
-
-        assert_equal 0 $omem
     }
 }
