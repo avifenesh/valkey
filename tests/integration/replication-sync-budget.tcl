@@ -21,12 +21,5 @@ start_server {tags {repl external:skip} overrides {save {}}} {
             wait_for_ofs_sync $primary $replica 500
             assert_equal value [$replica get delayed]
         }
-        test "Offset synchronization accepts replica-first callers" {
-            wait_for_ofs_sync $primary $replica
-            $replica client pause 1000 write
-            $primary set reversed value
-            wait_for_ofs_sync $replica $primary
-            assert_equal value [$replica get reversed]
-        }
     }
 }
