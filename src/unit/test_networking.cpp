@@ -28,7 +28,7 @@ typedef struct bulkStrRef {
 
 typedef struct __attribute__((__packed__)) payloadHeader {
     size_t payload_len;
-    size_t reply_len;
+    uint64_t reply_len;
     int16_t slot;
     uint8_t payload_type : 1;
     uint8_t track_bytes : 1;
@@ -472,6 +472,34 @@ static void freeReplyOffloadClient(client *c) {
     listRelease(c->reply);
     zfree(c->buf);
     zfree(c);
+}
+
+/* Deferred output keeps the soft interval alive even when active replies drain. */
+TEST_F(NetworkingTest, SoftLimitContinuityIncludesDeferredOutput) {
+    client *c = createTestClient();
+    clientBufferLimitsConfig old_limits = server.client_obuf_limits[CLIENT_TYPE_NORMAL];
+    user *old_user = DefaultUser;
+    user default_user = {};
+    default_user.flags = USER_FLAG_NOPASS;
+    DefaultUser = &default_user;
+    time_t old_time = server.unixtime;
+    server.client_obuf_limits[CLIENT_TYPE_NORMAL] = {0, 200000, 1};
+    server.unixtime = 1;
+    c->obuf_soft_limit_reached_time = server.unixtime;
+    c->deferred_reply = listCreate();
+    c->deferred_reply_bytes = 200001;
+
+    EXPECT_EQ(closeClientOnOutputBufferLimitReached(c, 1), 0);
+    EXPECT_EQ(c->obuf_soft_limit_reached_time, server.unixtime);
+    c->deferred_reply_bytes = 0;
+    EXPECT_EQ(closeClientOnOutputBufferLimitReached(c, 1), 0);
+    EXPECT_EQ(c->obuf_soft_limit_reached_time, 0);
+
+    server.client_obuf_limits[CLIENT_TYPE_NORMAL] = old_limits;
+    server.unixtime = old_time;
+    DefaultUser = old_user;
+    listRelease(c->deferred_reply);
+    freeReplyOffloadClient(c);
 }
 
 /* Each bulk offload puts 2 pointers to a reply buffer */
