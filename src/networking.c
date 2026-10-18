@@ -3312,7 +3312,7 @@ void resetLastWrittenBuf(client *c) {
 
 /* Track BULK_STR_REF sizes.
  * Calculates reply_len for BULK_STR_REFs if not already set, and adds to client's tracking counter.
- * This is called from I/O thread before writing to account for actual reply sizes. */
+ * Called before writing, from either the main thread or an I/O thread. */
 static void trackBufReferences(char *buf, size_t bufpos, client *c) {
     serverAssert(c);
 
@@ -3348,6 +3348,36 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
         ptr += header->payload_len;
     }
     serverAssert(ptr == buf + bufpos);
+}
+
+/* Account referenced replies before a writer can drain them. Limit checks and
+ * client closure must remain on the main thread, before I/O ownership changes.
+ * Returns non-zero when the client must not be written to. */
+int checkClientOutputBufferLimitsBeforeWrite(client *c) {
+    serverAssert(inMainThread());
+    serverAssert(c->io_write_state == CLIENT_IDLE);
+    if (c->flag.close_asap) return 1;
+    if (c->flag.fake || !c->conn) return 0;
+
+    int type = getClientType(c);
+    /* Replicas use the shared replication buffers, without encoded replies. */
+    if (type == CLIENT_TYPE_REPLICA) return 0;
+    if (type == CLIENT_TYPE_PRIMARY || type == CLIENT_TYPE_SLOT_IMPORT) type = CLIENT_TYPE_NORMAL;
+    if (type == CLIENT_TYPE_SLOT_EXPORT) type = CLIENT_TYPE_REPLICA;
+    /* Keep the default unlimited normal-client path free of buffer scans. */
+    if (!server.client_obuf_limits[type].hard_limit_bytes && !server.client_obuf_limits[type].soft_limit_bytes &&
+        !(authRequired(c) && !clientEverAuthenticated(c)))
+        return 0;
+
+    if (c->flag.buf_encoded && c->bufpos) trackBufReferences(c->buf, c->bufpos, c);
+    listIter iter;
+    listNode *ln;
+    listRewind(c->reply, &iter);
+    while ((ln = listNext(&iter))) {
+        clientReplyBlock *block = listNodeValue(ln);
+        if (block && block->flag.buf_encoded) trackBufReferences(block->buf, block->used, c);
+    }
+    return closeClientOnOutputBufferLimitReached(c, 1);
 }
 
 /* Release references to string objects inside an encoded buffer */
@@ -3520,6 +3550,7 @@ int postWriteToClient(client *c) {
  * This function is called by main-thread only */
 int writeToClient(client *c) {
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return C_OK;
+    if (checkClientOutputBufferLimitsBeforeWrite(c)) return C_ERR;
 
     c->nwritten = 0;
     c->write_flags = 0;

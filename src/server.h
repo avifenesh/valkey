@@ -3189,6 +3189,7 @@ size_t getClientOutputBufferMemoryUsage(client *c);
 size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage);
 int freeClientsInAsyncFreeQueue(void);
 int closeClientOnOutputBufferLimitReached(client *c, int async);
+int checkClientOutputBufferLimitsBeforeWrite(client *c);
 int getClientType(client *c);
 int getClientTypeByName(char *name);
 char *getClientTypeName(int client_class);

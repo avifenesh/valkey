@@ -728,6 +728,8 @@ int trySendWriteToIOThreads(client *c) {
      * as concurrent IO thread writes would race with the main thread processing incoming
      * ACKs on the same client's query buffer. */
     if (c->slot_migration_job && !clusterSlotMigrationShouldInstallWriteHandler(c)) return C_ERR;
+    /* A scheduled close is handled, not a request for synchronous fallback. */
+    if (checkClientOutputBufferLimitsBeforeWrite(c)) return C_OK;
 
     int is_replica = getClientType(c) == CLIENT_TYPE_REPLICA;
     clientReplyBlock *block = NULL;

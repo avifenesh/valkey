@@ -318,6 +318,47 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         }
     }
 
+    foreach io_threads {1 4} {
+        test "Copy avoidance enforces the hard limit before a single reply with $io_threads IO threads" {
+            r config set min-io-threads-avoid-copy-reply 1
+            r config set io-threads $io_threads
+            set old_always_active [lindex [r config get io-threads-always-active] 1]
+            r config set io-threads-always-active yes
+            if {$io_threads > 1} {
+                wait_for_condition 50 10 {
+                    [getInfoProperty [r info server] io_threads_active] > 0
+                } else {
+                    fail "I/O threads did not activate"
+                }
+            }
+            r config set client-output-buffer-limit {normal 2000000 0 0}
+            set value [string repeat w [expr 1024*1024]]
+            r set single_reply_key $value
+
+            set rd [valkey_deferring_client]
+            $rd client setname single_reply_limit
+            assert_equal OK [$rd read]
+            $rd get single_reply_key
+            assert_equal $value [$rd read]
+            r config set client-output-buffer-limit {normal 200000 0 0}
+            # One referenced reply exceeds the hard limit while fitting in the
+            # encoded buffer. It must not drain before main-thread enforcement.
+            $rd get single_reply_key
+            set disconnected [catch {$rd read} err]
+            assert_equal 1 $disconnected
+            assert_match {I/O error reading reply} $err
+            wait_for_condition 50 100 {
+                [lsearch [split [r client list] "\r\n"] *name=single_reply_limit*] == -1
+            } else {
+                fail "Client remains connected after a single reply over the hard limit"
+            }
+            $rd close
+            r config set io-threads-always-active $old_always_active
+            r config set min-io-threads-avoid-copy-reply 0
+            r config set io-threads 1
+        }
+    }
+
     test {Copy avoidance obuf tracking with IO threads} {
         # Enable copy avoidance and IO threads
         r config set min-io-threads-avoid-copy-reply 1
