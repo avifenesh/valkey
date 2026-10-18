@@ -318,6 +318,70 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         }
     }
 
+    test {Copy avoidance soft limit resets after a complete drain} {
+        r config set min-io-threads-avoid-copy-reply 1
+        r config set io-threads 1
+        r config set client-output-buffer-limit {normal 0 200000 1}
+        set value [string repeat s [expr 1024*1024]]
+        r set soft_drain_key $value
+        set rd [valkey_deferring_client]
+        $rd client id
+        set client_id [$rd read]
+        $rd get soft_drain_key
+        assert_equal $value [$rd read]
+        wait_for_condition 50 10 {
+            [get_field_in_client_list $client_id [r client list] omem] == 0
+        } else {
+            fail "First soft-limit reply did not fully drain"
+        }
+        # Exceed the one-second soft interval, without retaining any replies.
+        after 2100
+        $rd get soft_drain_key
+        set disconnected [catch {$rd read} reply]
+        assert_equal 0 $disconnected
+        assert_equal $value $reply
+        $rd close
+        r config set min-io-threads-avoid-copy-reply 0
+    }
+
+    test {Copy avoidance respects configured limits beyond 32-bit} {
+        r config set min-io-threads-avoid-copy-reply 1
+        r config set io-threads 1
+        r config set client-output-buffer-limit {normal 8589934592 0 0}
+        set value [string repeat l [expr 1024*1024]]
+        r set wide_limit_key $value
+        set rd [valkey_deferring_client]
+        $rd get wide_limit_key
+        set disconnected [catch {$rd read} reply]
+        assert_equal 0 $disconnected
+        assert_equal $value $reply
+        $rd close
+        r config set min-io-threads-avoid-copy-reply 0
+    }
+
+    test {Copy avoidance counts logical replies beyond 32-bit} {
+        r config set min-io-threads-avoid-copy-reply 1
+        r config set io-threads 1
+        r config set client-output-buffer-limit {normal 33554432 0 0}
+        r set wide_reply_key [string repeat l [expr 16*1024*1024]]
+        set rd [valkey_deferring_client]
+        $rd client id
+        set client_id [$rd read]
+        set limit_closures [getInfoProperty [r info stats] client_output_buffer_limit_disconnections]
+        # Reuse one value: the logical reply exceeds 4 GiB, but the encoded
+        # references fit in the static buffer. No oversized reply is read.
+        $rd mget {*}[lrepeat 257 wide_reply_key]
+        $rd flush
+        wait_for_condition 50 100 {
+            [get_field_in_client_list $client_id [r client list] id] eq ""
+        } else {
+            fail "Logical reply overflow escaped the output-buffer hard limit"
+        }
+        assert_equal [expr {$limit_closures + 1}] [getInfoProperty [r info stats] client_output_buffer_limit_disconnections]
+        $rd close
+        r config set min-io-threads-avoid-copy-reply 0
+    }
+
     foreach io_threads {1 4} {
         test "Copy avoidance enforces the hard limit before a single reply with $io_threads IO threads" {
             r config set min-io-threads-avoid-copy-reply 1
@@ -444,7 +508,7 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
             # Each pipelined GET for a 16 KB value requires payloadHeader (20 bytes on 64-bit)
             # and bulkStrRef (16 bytes) in client buf (PROTO_REPLY_CHUNK_BYTES = 16 KB).
             # 1300 commands * ~36 bytes/header >> 16 KB, so replies spill into c->reply list.
-            # On 32-bit header size is smaller, so we need 3000 commands * ~20 bytes/header >> 16 KB.
+            # On 32-bit header size is smaller, so we need 3000 commands * ~24 bytes/header >> 16 KB.
             if {[s arch_bits] == 64} {
                 set cmd_count 1300
             } else {
