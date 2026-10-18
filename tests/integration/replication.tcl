@@ -542,9 +542,11 @@ foreach mdl {no yes} dualchannel {no yes} {
                             # Make sure no more commands processed
                             wait_load_handlers_disconnected -3
 
-                            wait_for_ofs_sync $master [lindex $slaves 0]
-                            wait_for_ofs_sync $master [lindex $slaves 1]
-                            wait_for_ofs_sync $master [lindex $slaves 2]
+                            # Use the same 50-second catch-up budget as the connection
+                            # wait above. ASan can leave offsets behind after the load stops.
+                            wait_for_ofs_sync $master [lindex $slaves 0] 500
+                            wait_for_ofs_sync $master [lindex $slaves 1] 500
+                            wait_for_ofs_sync $master [lindex $slaves 2] 500
 
                             assert [string match *replicas_waiting_psync:0* [$master info replication]]
 
