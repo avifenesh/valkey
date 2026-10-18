@@ -332,12 +332,11 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         $rd client setname iothread_test
         assert {[$rd read] eq "OK"}
         
-        # Send multiple GETs without reading, until the output-buffer limit
-        # enforcement is observable: either we see omem exceed the limit, or
-        # the server has already disconnected the client (with IO threads the
-        # disconnect can happen between polls, and a write to the closed
-        # connection raises an error). The loop is bounded so a broken
-        # accounting path fails the test instead of hanging it.
+        # Keep sending until the hard limit disconnects the client. An I/O
+        # thread can briefly report referenced bytes above the limit and then
+        # drain them into TLS or kernel buffers before the limit check runs.
+        # Stopping at that snapshot would remove the required backpressure.
+        # Bound the load so broken accounting fails instead of hanging.
         set omem 0
         set disconnected 0
         for {set i 0} {$i < 500} {incr i} {
@@ -363,7 +362,6 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
                 set disconnected 1
                 break
             }
-            if {$omem >= 200000} break
         }
 
         if {!$disconnected} {
