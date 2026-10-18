@@ -355,6 +355,7 @@ static_assert(sizeof(hashtablePosition) >= sizeof(position),
 /* State for incremental find. */
 typedef struct {
     enum {
+        HASHTABLE_INIT,
         HASHTABLE_CHECK_ENTRY,
         HASHTABLE_NEXT_ENTRY,
         HASHTABLE_NEXT_BUCKET,
@@ -1891,15 +1892,14 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
  */
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key) {
     incrementalFind *data = incrementalFindFromOpaque(state);
-    if (hashtableSize(ht) == 0) {
-        data->state = HASHTABLE_NOT_FOUND;
-    } else {
-        data->state = HASHTABLE_NEXT_BUCKET;
-        data->bucket = NULL;
-        data->hashtable = ht;
-        data->key = key;
-        data->hash = hashKey(ht, key);
-    }
+    /* Don't touch the hashtable struct here. It may not be in the cache (e.g.
+     * one of many per-slot tables in cluster mode), so prefetch it and defer
+     * the size check and the hashing of the key to the first step. */
+    data->state = HASHTABLE_INIT;
+    data->bucket = NULL;
+    data->hashtable = ht;
+    data->key = key;
+    valkey_prefetch(ht);
 }
 
 /* Returns true if more work is needed, false when done. Call this function repeatedly
@@ -1907,7 +1907,18 @@ void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtabl
  * result. */
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
     incrementalFind *data = incrementalFindFromOpaque(state);
+    if (data->state == HASHTABLE_INIT) {
+        /* The hashtable struct is prefetched. */
+        if (hashtableSize(data->hashtable) == 0) {
+            data->state = HASHTABLE_NOT_FOUND;
+            return false;
+        }
+        data->hash = hashKey(data->hashtable, data->key);
+        data->state = HASHTABLE_NEXT_BUCKET;
+    }
     switch (data->state) {
+    case HASHTABLE_INIT:
+        break; /* Unreachable. Handled above. */
     case HASHTABLE_CHECK_ENTRY:
         /* Current entry is prefetched. Now check if it's a match. */
         {
