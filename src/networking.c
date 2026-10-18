@@ -6859,8 +6859,7 @@ int closeClientOnOutputBufferLimitReached(client *c, int async) {
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
      * (they use the global repl buffers). */
-    uint64_t tracked_len = atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed);
-    if (c->reply_bytes == 0 && tracked_len == 0 && getClientType(c) != CLIENT_TYPE_REPLICA) {
+    if (getClientType(c) != CLIENT_TYPE_REPLICA && getClientOutputBufferMemoryUsage64(c) == 0) {
         c->obuf_soft_limit_reached_time = 0;
         return 0;
     }
