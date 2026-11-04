@@ -1539,8 +1539,10 @@ test "Dual channel replication buffer memory fields" {
         $primary config set repl-backlog-size 1
         $primary config set client-output-buffer-limit "replica 0 0 0"
 
-        $primary config set rdb-key-save-delay 2000000
-        for {set j 0} {$j < 1000} {incr j} {
+        set snapshot_keys 1000
+        set snapshot_delay_us 2000000
+        $primary config set rdb-key-save-delay $snapshot_delay_us
+        for {set j 0} {$j < $snapshot_keys} {incr j} {
             $primary set "key-$j" $j
         }
 
@@ -1549,6 +1551,10 @@ test "Dual channel replication buffer memory fields" {
             set replica_srv_id 0
 
             $replica config set dual-channel-replication-enabled yes
+            # Keep the deliberately stalled RDB channel alive for the fixture's
+            # snapshot duration. The normal 60-second idle timeout can abort it
+            # while a loaded TLS runner is still sending the buffered writes.
+            $replica config set repl-timeout [expr {($snapshot_keys * $snapshot_delay_us + 999999) / 1000000}]
             $replica config set loading-process-events-interval-bytes 1024
             $replica config set client-output-buffer-limit "replica 0 0 0"
 
