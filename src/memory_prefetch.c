@@ -125,7 +125,9 @@ static void initBatchInfo(hashtable **tables) {
     /* Initialize the prefetch info */
     for (size_t i = 0; i < batch->key_count; i++) {
         KeyPrefetchInfo *info = &batch->prefetch_info[i];
-        if (!tables[i] || hashtableSize(tables[i]) == 0) {
+        /* Don't check the table size here, it would touch every table struct
+         * one by one. The incremental find prefetches it and handles empty tables. */
+        if (!tables[i]) {
             info->state = PREFETCH_DONE;
             batch->keys_done++;
             continue;
@@ -202,19 +204,16 @@ static void prefetchValueNested(KeyPrefetchInfo *info) {
             markKeyAsdone(info);
             return;
         }
-        /* The zset hashtable stores packed [score][element] items, so a plain sds
-         * lookup key must be marked for the callbacks to read it as an element. */
-        sds member = objectGetVal(info->member);
-        if (info->inner_is_zset) zsetMarkLookupKey(member);
-        hashtableIncrementalFindInit(&info->inner_hashtab_state, inner_ht, member);
-        if (info->inner_is_zset) zsetUnmarkLookupKey(member);
+        hashtableIncrementalFindInit(&info->inner_hashtab_state, inner_ht, objectGetVal(info->member));
         info->nested_phase = NESTED_PREFETCH_STEP;
         moveToNextKey();
         return;
     }
 
     case NESTED_PREFETCH_STEP: {
-        /* A step may invoke the compare callback, so mark the lookup key here too. */
+        /* The zset hashtable stores packed [score][element] items, so a plain sds
+         * lookup key must be marked for the hash and compare callbacks, which run
+         * in the steps, to read it as an element. */
         sds step_member = objectGetVal(info->member);
         if (info->inner_is_zset) zsetMarkLookupKey(step_member);
         int more = hashtableIncrementalFindStep(&info->inner_hashtab_state);

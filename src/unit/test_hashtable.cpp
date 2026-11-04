@@ -554,6 +554,32 @@ TEST_F(HashtableTest, incremental_find) {
     free(element_array);
 }
 
+TEST_F(HashtableTest, incremental_find_empty_and_missing) {
+    uint8_t elements[2];
+    hashtableType type = {};
+    hashtable *ht = hashtableCreate(&type);
+    hashtableIncrementalFindState state;
+    void *found = NULL;
+
+    /* Empty table: the first step completes the find without a match. */
+    hashtableIncrementalFindInit(&state, ht, &elements[0]);
+    ASSERT_FALSE(hashtableIncrementalFindStep(&state));
+    ASSERT_FALSE(hashtableIncrementalFindGetResult(&state, &found));
+
+    ASSERT_TRUE(hashtableAdd(ht, &elements[0]));
+    hashtableIncrementalFindInit(&state, ht, &elements[0]);
+    while (hashtableIncrementalFindStep(&state));
+    ASSERT_TRUE(hashtableIncrementalFindGetResult(&state, &found));
+    ASSERT_EQ(found, &elements[0]);
+
+    /* Non-empty table, missing key. */
+    hashtableIncrementalFindInit(&state, ht, &elements[1]);
+    while (hashtableIncrementalFindStep(&state));
+    ASSERT_FALSE(hashtableIncrementalFindGetResult(&state, &found));
+
+    hashtableRelease(ht);
+}
+
 /* Helper types and functions for scan tests */
 typedef struct {
     long count;
